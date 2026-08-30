@@ -1,0 +1,13 @@
+{
+  "name": "MeshKeeper",
+  "short_name": "MeshKeeper",
+  "description": "Локальный учёт оборудования с offline-оболочкой",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#F4F4FB",
+  "theme_color": "#5E629B",
+  "lang": "ru",
+  "icons": [
+    { "src": "/logo-mark.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
