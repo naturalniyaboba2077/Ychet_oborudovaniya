@@ -54,6 +54,18 @@ export default function Join() {
   const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [busy, setBusy] = useState(false)
+  const [googleBusy, setGoogleBusy] = useState(false)
+  const googleEnabled =
+    trpc.auth.options.useQuery(undefined, { retry: 0 }).data?.googleEnabled === true
+  const googleBegin = trpc.auth.googleBegin.useMutation({
+    onSuccess: (data) => {
+      window.location.href = data.url
+    },
+    onError: (e) => {
+      setGoogleBusy(false)
+      toast.error(e.message || 'Не удалось начать вход через Google')
+    },
+  })
 
   const wsName = useMemo(() => info.data?.workspace?.name ?? 'группу', [info.data])
 
@@ -137,6 +149,33 @@ export default function Join() {
               {busy ? <Loader2 className="animate-spin" size={18} /> : null}
               Зарегистрироваться и вступить
             </button>
+            {googleEnabled && (
+              <>
+                <div className="flex items-center gap-3">
+                  <span className="h-px flex-1 bg-brand-100" />
+                  <span className="text-[13px] text-ink-300">или</span>
+                  <span className="h-px flex-1 bg-brand-100" />
+                </div>
+                <button
+                  type="button"
+                  disabled={googleBusy}
+                  onClick={() => {
+                    // Пароль не нужен, а имя и телефон нужны: Google их не
+                    // сообщает, а телефон в системе учёта обязателен.
+                    if (!name.trim() || phone.replace(/\D/g, '').length < 11) {
+                      toast.error('Сначала укажите имя и телефон')
+                      return
+                    }
+                    setGoogleBusy(true)
+                    googleBegin.mutate({ inviteToken: token, phone, fullName: name.trim() })
+                  }}
+                  className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-brand-100 bg-surface text-sm font-semibold text-ink-900 hover:bg-brand-50 disabled:opacity-60"
+                >
+                  {googleBusy ? <Loader2 className="animate-spin" size={18} /> : null}
+                  Продолжить через Google
+                </button>
+              </>
+            )}
             <button type="button" className="w-full text-sm font-semibold text-brand-600" onClick={() => navigate(`/login?join=${token}`)}>
               У меня уже есть аккаунт
             </button>

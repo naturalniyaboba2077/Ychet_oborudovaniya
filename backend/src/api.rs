@@ -549,6 +549,7 @@ pub fn dispatch(
             | "auth.joinRegister"
             | "auth.inviteInfo"
             | "auth.logout"
+            | "auth.googleBegin"
             | "auth.options"
     ) || (procedure == "auth.directory"
         && std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"));
@@ -651,6 +652,7 @@ fn dispatch_inner(
             }
         }
         "auth.options" => auth_options(conn),
+        "auth.googleBegin" => auth_google_begin(conn, input, user_id),
         "auth.login" => auth_login(conn, input),
         "auth.register" => auth_register(conn, input),
         "auth.join" => auth_join(conn, input, user_id),
@@ -840,7 +842,138 @@ fn auth_options(conn: &Connection) -> ApiResult {
         "registrationOpen": users == 0 || open,
         "bootstrap": users == 0,
         "demoLogin": std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"),
+        "googleEnabled": crate::google::enabled(),
     }))
+}
+
+/// Готовит вход через Google и возвращает адрес, куда уходит браузер.
+///
+/// Телефон и имя принимаются здесь, а не после возвращения от Google:
+/// номер в системе обязателен, а Google его не сообщает.
+fn auth_google_begin(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    if !crate::google::enabled() {
+        return Err(ApiError::bad("Вход через Google не настроен"));
+    }
+    let invite = s(input, "inviteToken");
+    let phone = s(input, "phone");
+    let full_name = s(input, "fullName");
+    // Приглашение проверяем сразу: незачем гонять человека на Google, чтобы
+    // отказать ему на обратном пути.
+    if let Some(token) = invite.as_deref() {
+        let found = invite_by_token(conn, token)?;
+        ensure_invite_usable(&found)?;
+        if phone.is_none() {
+            return Err(ApiError::bad("Введите телефон"));
+        }
+    }
+    let url = crate::google::begin(
+        conn,
+        invite.as_deref(),
+        phone.as_deref(),
+        full_name.as_deref(),
+        user_id,
+    )
+    .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(json!({ "url": url }))
+}
+
+/// Завершает вход: находит или заводит пользователя по ответу Google.
+/// Возвращает его идентификатор — сессию выдаёт вызывающий.
+pub fn google_finish(
+    conn: &Connection,
+    identity: &crate::google::Identity,
+    pending: &crate::google::Pending,
+) -> Result<i64, ApiError> {
+    // Уже привязанный аккаунт — просто вход.
+    if let Some(uid) = conn
+        .query_row(
+            "SELECT id FROM users WHERE google_sub=?1",
+            params![identity.sub],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        if let Some(token) = pending.invite_token.as_deref() {
+            consume_invite(conn, token, uid)?;
+        }
+        return Ok(uid);
+    }
+    // Привязка к уже вошедшему — он доказал права сессией, так что просто
+    // дописываем Google к его карточке.
+    if let Some(link_to) = pending.link_user_id {
+        conn.execute(
+            "UPDATE users SET google_sub=?1, email=COALESCE(NULLIF(email,''),?2) WHERE id=?3",
+            params![identity.sub, identity.email, link_to],
+        )?;
+        if let Some(token) = pending.invite_token.as_deref() {
+            consume_invite(conn, token, link_to)?;
+        }
+        return Ok(link_to);
+    }
+    // Новый человек. Без приглашения внутрь нельзя — регистрация закрытая.
+    let token = pending
+        .invite_token
+        .as_deref()
+        .ok_or_else(|| ApiError::unauth("Нужно приглашение: свободной регистрации нет"))?;
+    let invite = invite_by_token(conn, token)?;
+    ensure_invite_usable(&invite)?;
+    // Телефон занят. Молча привязать сюда Google нельзя: приглашение есть у
+    // любого, кому его переслали, и он вписал бы чужой номер — например
+    // владельца — и забрал бы аккаунт. Пускаем только в карточку, которую
+    // администратор сам завёл под этого человека и которая ждёт активации
+    // именно в этой группе.
+    if let Some(phone) = pending.phone.as_deref() {
+        if let Some(existing) = find_user_phone(conn, phone) {
+            let awaiting: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM user_workspaces uw JOIN users u ON u.id=uw.user_id
+                 WHERE uw.user_id=?1 AND uw.workspace_id=?2 AND u.status='invited'",
+                params![existing, invite.workspace_id],
+                |r| r.get(0),
+            )?;
+            if awaiting == 0 {
+                return Err(ApiError::unauth(
+                    "Аккаунт с таким телефоном уже есть. Войдите паролем и привяжите Google в профиле.",
+                ));
+            }
+            conn.execute(
+                "UPDATE users SET google_sub=?1, email=COALESCE(NULLIF(email,''),?2), status='active' WHERE id=?3",
+                params![identity.sub, identity.email, existing],
+            )?;
+            consume_invite(conn, token, existing)?;
+            return Ok(existing);
+        }
+    }
+    let phone = pending
+        .phone
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("Введите телефон"))?;
+    let full_name = pending
+        .full_name
+        .as_deref()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or(identity.name.as_str());
+    if full_name.trim().is_empty() {
+        return Err(ApiError::bad("Введите имя"));
+    }
+    // password_hash остаётся пустым: пароля у такого аккаунта нет вовсе,
+    // и auth.login его не пустит — вход только через Google.
+    conn.execute(
+        "INSERT INTO users (full_name, position, phone, status, role_rights, email, google_sub, created_at)
+         VALUES (?1,?2,?3,'active',?4,?5,?6,?7)",
+        params![
+            full_name,
+            invite_position(&invite.role),
+            phone,
+            db::rights_for_role(&invite.role).to_string(),
+            identity.email,
+            identity.sub,
+            now()
+        ],
+    )
+    .map_err(|e| ApiError::bad(e.to_string()))?;
+    let uid = conn.last_insert_rowid();
+    consume_invite(conn, token, uid)?;
+    Ok(uid)
 }
 
 /// Сколько неудачных попыток проходит без задержки.
@@ -3986,6 +4119,136 @@ mod tests {
         assert!(chrono::DateTime::parse_from_rfc3339(expires).unwrap() > chrono::Utc::now());
         assert_eq!(created["role"].as_str(), Some("viewer"));
         assert_eq!(created["payload"]["role"].as_str(), Some("viewer"));
+        cleanup(conn, path);
+    }
+
+    /// Приглашение можно переслать кому угодно, поэтому предъявитель не
+    /// должен получать чужую карточку, вписав чужой телефон.
+    #[test]
+    fn google_invite_cannot_take_over_an_existing_account() {
+        let (mut conn, path, users, ws) = test_db();
+        let owner_phone: String = conn
+            .query_row(
+                "SELECT phone FROM users WHERE id=?1",
+                params![users[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let created = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "member", "maxUses": 5}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let token = created["token"].as_str().unwrap().to_string();
+
+        let identity = crate::google::Identity {
+            sub: "chuzhoy-google-akkaunt".into(),
+            email: "chuzhoy@example.com".into(),
+            name: "Чужой".into(),
+        };
+        let pending = crate::google::Pending {
+            invite_token: Some(token),
+            phone: Some(owner_phone),
+            full_name: Some("Чужой".into()),
+            link_user_id: None,
+        };
+        let attempt = google_finish(&conn, &identity, &pending);
+        assert!(
+            attempt.is_err(),
+            "захват чужого аккаунта должен отклоняться"
+        );
+
+        // Владелец остался при своём: Google к нему не прицепился.
+        let sub: Option<String> = conn
+            .query_row(
+                "SELECT google_sub FROM users WHERE id=?1",
+                params![users[0]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sub, None);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn google_invite_creates_a_passwordless_account() {
+        let (mut conn, path, users, ws) = test_db();
+        let created = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "member", "maxUses": 5}),
+            Some(users[0]),
+        )
+        .unwrap();
+        let token = created["token"].as_str().unwrap().to_string();
+
+        let identity = crate::google::Identity {
+            sub: "novyy-google-akkaunt".into(),
+            email: "montazhnik@example.com".into(),
+            name: "Монтажник".into(),
+        };
+        let pending = crate::google::Pending {
+            invite_token: Some(token),
+            phone: Some("+79995552222".into()),
+            full_name: Some("Монтажник".into()),
+            link_user_id: None,
+        };
+        let uid = google_finish(&conn, &identity, &pending).expect("вход через Google");
+
+        // Пароля у такого аккаунта нет вовсе — войти им по паролю нельзя.
+        let hash: Option<String> = conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE id=?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(hash.unwrap_or_default().is_empty());
+        let member: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![uid, ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(member, 1, "приглашение должно завести членство");
+
+        // Повторный вход тем же Google — тот же человек, не второй аккаунт.
+        let again = google_finish(
+            &conn,
+            &identity,
+            &crate::google::Pending {
+                invite_token: None,
+                phone: None,
+                full_name: None,
+                link_user_id: None,
+            },
+        )
+        .expect("повторный вход");
+        assert_eq!(again, uid);
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn google_without_invite_is_refused_for_unknown_person() {
+        let (conn, path, _users, _ws) = test_db();
+        let attempt = google_finish(
+            &conn,
+            &crate::google::Identity {
+                sub: "nikto".into(),
+                email: "nikto@example.com".into(),
+                name: "Никто".into(),
+            },
+            &crate::google::Pending {
+                invite_token: None,
+                phone: Some("+79995553333".into()),
+                full_name: Some("Никто".into()),
+                link_user_id: None,
+            },
+        );
+        assert!(attempt.is_err(), "свободной регистрации быть не должно");
         cleanup(conn, path);
     }
 

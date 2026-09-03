@@ -1,6 +1,7 @@
 mod api;
 mod auth;
 mod db;
+mod google;
 mod json;
 mod ledger;
 mod sync;
@@ -220,6 +221,90 @@ async fn spa_index(State(index): State<Arc<PathBuf>>, uri: Uri) -> impl IntoResp
         )
             .into_response(),
     }
+}
+
+/// Возвращение от Google. Отдаёт HTML, а не редирект, намеренно: сессионная
+/// cookie помечена SameSite=Strict, и при переходе, начатом на стороне
+/// google.com, браузер её на следующий запрос не пошлёт. Страница же уводит
+/// на приложение уже своим переходом — он считается своим, и cookie доедет.
+async fn google_callback(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    if let Some(error) = q.get("error") {
+        return google_page(None, &format!("Google отказал: {error}"));
+    }
+    let (Some(code), Some(oauth_state)) = (q.get("code"), q.get("state")) else {
+        return google_page(None, "Google вернул неполный ответ");
+    };
+    // Замок держим только на время работы с базой: обмен кода ходит в сеть,
+    // и удерживать соединение всё это время нельзя — встанут другие запросы.
+    let pending = {
+        let conn = state.db.lock();
+        google::take_pending(&conn, oauth_state)
+    };
+    let Some(pending) = pending else {
+        return google_page(None, "Ссылка устарела, попробуйте войти заново");
+    };
+    let identity = match google::exchange(code).await {
+        Ok(v) => v,
+        Err(e) => return google_page(None, &format!("Не удалось проверить аккаунт: {e}")),
+    };
+    let issued = {
+        let conn = state.db.lock();
+        match api::google_finish(&conn, &identity, &pending) {
+            Ok(uid) => auth::create_session(&conn, uid)
+                .map_err(|e| api::ApiError::internal(format!("Не удалось создать сессию: {e}"))),
+            Err(e) => Err(e),
+        }
+    };
+    match issued {
+        Ok(token) => google_page(Some(&token), ""),
+        Err(e) => google_page(None, &e.message),
+    }
+}
+
+/// Страница-переходник. При успехе ставит cookie и уводит в приложение,
+/// при отказе показывает причину и ссылку назад на вход.
+fn google_page(session: Option<&str>, error: &str) -> axum::response::Response {
+    let body = if error.is_empty() {
+        "<!doctype html><meta charset=\"utf-8\"><title>Вход выполнен</title>\
+         <p style=\"font:16px system-ui;margin:3rem\">Входим…</p>\
+         <script>location.replace('/')</script>"
+            .to_string()
+    } else {
+        format!(
+            "<!doctype html><meta charset=\"utf-8\"><title>Вход не удался</title>\
+             <div style=\"font:16px system-ui;margin:3rem;max-width:34rem\">\
+             <h1 style=\"font-size:1.25rem\">Войти через Google не получилось</h1>\
+             <p>{}</p><p><a href=\"/login\">Вернуться ко входу</a></p></div>",
+            html_escape(error)
+        )
+    };
+    let mut builder = axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8");
+    if let Some(token) = session {
+        let secure = std::env::var("MESHKEEPER_COOKIE_SECURE").as_deref() == Ok("1");
+        builder = builder.header(
+            "set-cookie",
+            format!(
+                "mk_session={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=2592000{}",
+                if secure { "; Secure" } else { "" }
+            ),
+        );
+    }
+    builder
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Текст ошибки приходит в том числе от Google — в разметку его без экранирования пускать нельзя.
+fn html_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
 async fn health() -> impl IntoResponse {
@@ -491,6 +576,7 @@ async fn main() {
             "/sync/journal",
             get(sync_journal_get).post(sync_journal_post),
         )
+        .route("/auth/google/callback", get(google_callback))
         .route("/api/trpc/{*procedures}", any(trpc))
         .fallback_service(static_files)
         .with_state(state);

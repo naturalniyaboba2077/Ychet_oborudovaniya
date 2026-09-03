@@ -86,8 +86,28 @@ fn migrate(conn: &Connection) -> Result<()> {
         "UPDATE user_workspaces SET rights_json=(SELECT role_rights FROM users WHERE users.id=user_workspaces.user_id) WHERE rights_json IS NULL",
         [],
     )?;
+    // Вход через Google. Телефон остаётся обязательным и дальше: в системе
+    // учёта именно он связывает карточку с живым человеком, а Google его не
+    // сообщает — поэтому номер спрашивается на форме приглашения, до ухода
+    // на Google. Здесь хранится только привязка аккаунта.
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN email TEXT", []);
+    let _ = conn.execute("ALTER TABLE users ADD COLUMN google_sub TEXT", []);
+    // Частичный индекс: пустых `google_sub` в базе много, и обычный UNIQUE
+    // считал бы их одинаковыми.
+    let _ = conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL",
+        [],
+    );
     conn.execute_batch(
         r#"
+        CREATE TABLE IF NOT EXISTS google_pending (
+          state TEXT PRIMARY KEY,
+          invite_token TEXT,
+          phone TEXT,
+          full_name TEXT,
+          link_user_id INTEGER,
+          created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS faults (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           item_id INTEGER NOT NULL,

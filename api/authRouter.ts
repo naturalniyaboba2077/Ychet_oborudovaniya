@@ -158,7 +158,21 @@ export const authRouter = createRouter({
     registrationOpen: false,
     bootstrap: false,
     demoLogin: false,
+    googleEnabled: false,
   })),
+
+  // Заводит попытку входа через Google и отдаёт адрес, куда уходит браузер.
+  // Телефон и имя принимаются здесь, потому что Google их не сообщает, а в
+  // системе учёта телефон обязателен.
+  googleBegin: publicQuery
+    .input(
+      z.object({
+        inviteToken: z.string().optional(),
+        phone: z.string().optional(),
+        fullName: z.string().optional(),
+      }),
+    )
+    .mutation(async () => ({ url: "" })),
 
   inviteInfo: publicQuery
     .input(z.object({ token: z.string().min(1) }))
