@@ -1,5 +1,5 @@
 use crate::json as jsn;
-use crate::{db, ledger};
+use crate::{db, ledger, sync};
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -770,13 +770,7 @@ fn dispatch_inner(
         "admin.workspaces.list" => workspaces_list(conn),
         "admin.workspaces.create" => ws_create(conn, input, user_id),
         "admin.workspaces.update" => ws_update(conn, input),
-        "admin.workspaces.remove" => {
-            conn.execute(
-                "DELETE FROM workspaces WHERE id=?1",
-                params![i64v(input, "id").unwrap_or(0)],
-            )?;
-            Ok(json!({"ok": true}))
-        }
+        "admin.workspaces.remove" => remove_workspace(conn, input),
         "admin.workspaces.createInvite" => ws_create_invite(conn, input, user_id),
         "admin.workspaces.invites" => ws_invites(conn, input),
         "admin.storages.list" => storages_list(conn, input),
@@ -1776,15 +1770,103 @@ fn transfer_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> Api
     Ok(transfer)
 }
 
+/// Следующий номер передачи вида «ПП-0007».
+///
+/// Счётчик хранится в `kv`, а не выводится из таблицы: и COUNT(*), и MAX
+/// проседают, когда передачи удаляют — освободившийся номер достаётся
+/// следующей записи, и в отчётах оказываются две разные выдачи под одним
+/// номером. Дополнительно берём максимум уже существующих: обмен мог
+/// принести с другого узла номер больше нашего счётчика.
+///
+/// Оговорка: два узла, работающие офлайн,независимо выдадут одинаковый
+/// номер — общего счётчика у них нет. После обмена коллизия видна, и
+/// следующие номера её обходят.
 fn next_transfer_code(conn: &Connection, ws: i64) -> String {
-    let n: i64 = conn
+    let key = format!("transfer_seq:{ws}");
+    let stored: i64 = sync::kv_get(conn, &key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let seen: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM transfers WHERE workspace_id=?1",
+            "SELECT COALESCE(MAX(CAST(substr(code, 4) AS INTEGER)), 0)
+             FROM transfers WHERE workspace_id=?1 AND code LIKE 'ПП-%'",
             params![ws],
             |r| r.get(0),
         )
         .unwrap_or(0);
-    format!("ПП-{:04}", n + 1)
+    let mut n = stored.max(seen) + 1;
+    for _ in 0..1000 {
+        let code = format!("ПП-{n:04}");
+        let busy: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transfers WHERE workspace_id=?1 AND code=?2",
+                params![ws, code],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        if busy == 0 {
+            sync::kv_set(conn, &key, &n.to_string());
+            return code;
+        }
+        n += 1;
+    }
+    // Тысяча занятых подряд в норме невозможна, но молча выдать дубль хуже,
+    // чем некрасивый, зато точно уникальный номер.
+    format!("ПП-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Удаляет рабочее пространство.
+///
+/// Раньше это был голый DELETE: предметы, история, передачи и членства
+/// оставались висеть с идентификатором, которого больше нет, — они пропадали
+/// из интерфейса, но занимали место и портили выгрузки. Теперь пространство
+/// с содержимым удалить нельзя: историю ТЗ требует хранить, а решать за
+/// человека, что её пора стереть, мы не вправе. Пустое убирается вместе со
+/// своими справочниками.
+fn remove_workspace(conn: &Connection, input: &Value) -> ApiResult {
+    let id = i64v(input, "id").unwrap_or(0);
+    let items: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM items WHERE workspace_id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if items > 0 {
+        return Err(ApiError::bad(format!(
+            "В группе ещё {items} предметов. Перенесите или спишите их, потом удаляйте группу"
+        )));
+    }
+    let history: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM history_entries WHERE workspace_id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if history > 0 {
+        return Err(ApiError::bad(
+            "В группе есть журнал операций — его нельзя удалять вместе с группой",
+        ));
+    }
+    // Пространство пустое: сносим только то, что без него не имеет смысла.
+    for table in [
+        "user_workspaces",
+        "invites",
+        "storages",
+        "building_sites",
+        "statuses",
+        "categories",
+        "brands",
+        "chat_messages",
+    ] {
+        let _ = conn.execute(
+            &format!("DELETE FROM {table} WHERE workspace_id=?1"),
+            params![id],
+        );
+    }
+    conn.execute("DELETE FROM workspaces WHERE id=?1", params![id])?;
+    Ok(json!({"ok": true}))
 }
 
 fn checkout_policy(conn: &Connection, uid: i64) -> Value {
@@ -1850,10 +1932,21 @@ fn take_one_atomic(
     let item = jsn::item_json(conn, item_id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     ensure_item_circulates(conn, &item, item_id)?;
-    if item["responsibleUserId"].as_i64() == Some(uid)
-        && !item["quantitative"].as_bool().unwrap_or(false)
-    {
-        return Err(ApiError::bad("Инструмент уже у вас"));
+    // Штучный предмет всегда у кого-то одного. Забрать его «через голову»
+    // держателя нельзя: на этот случай в ТЗ есть передача с подтверждением,
+    // иначе факт изъятия нигде не всплывёт.
+    if !item["quantitative"].as_bool().unwrap_or(false) {
+        match item["responsibleUserId"].as_i64() {
+            Some(holder) if holder == uid => {
+                return Err(ApiError::bad("Инструмент уже у вас"));
+            }
+            Some(_) => {
+                return Err(ApiError::bad(
+                    "Инструмент числится за другим сотрудником — запросите передачу",
+                ));
+            }
+            None => {}
+        }
     }
     let policy = checkout_policy(conn, uid);
     if let Some(cats) = policy.get("allowedCategoryIds").and_then(|v| v.as_array()) {
@@ -1981,14 +2074,23 @@ fn take_one_atomic(
         .optional()
         .ok()
         .flatten();
+    // Условие в самом UPDATE — единственное, что защищает от одновременной
+    // выдачи: проверка выше читала состояние до записи, и между ними предмет
+    // мог уйти другому. Ноль изменённых строк означает, что опоздали.
+    let taken = conn.execute(
+        "UPDATE items SET responsible_user_id=?1, status_id=COALESCE(?2,status_id), due_at=?4
+         WHERE id=?3 AND responsible_user_id IS NULL",
+        params![uid, in_work, item_id, due_at],
+    )?;
+    if taken != 1 {
+        return Err(ApiError::conflict(
+            "Инструмент только что забрали; обновите список",
+        ));
+    }
     conn.execute(
         "INSERT INTO transfers (code, item_id, from_user_id, to_user_id, to_storage_id, building_site_id, workspace_id, status, comment, no_confirmation, photo_url, created_at, completed_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,1,?9,?10,?10)",
         params![code, item_id, from, uid, item["storageId"].as_i64(), item["buildingSiteId"].as_i64(), ws, comment, photo_url, now()],
-    )?;
-    conn.execute(
-        "UPDATE items SET responsible_user_id=?1, status_id=COALESCE(?2,status_id), due_at=?4 WHERE id=?3",
-        params![uid, in_work, item_id, due_at],
     )?;
     let title = item["title"].as_str().unwrap_or("");
     let from_name = jsn::user_public(conn, from)
@@ -4249,6 +4351,144 @@ mod tests {
             },
         );
         assert!(attempt.is_err(), "свободной регистрации быть не должно");
+        cleanup(conn, path);
+    }
+
+    /// Взять из рук коллеги нельзя: для этого есть передача с подтверждением.
+    /// Без этой проверки любой участник тихо переписывал бы на себя предмет,
+    /// за который отвечает другой, и в отчётах пропадал бы факт изъятия.
+    #[test]
+    fn taking_an_item_held_by_someone_else_is_refused() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item}),
+            Some(users[1]),
+        )
+        .expect("свободный предмет берётся");
+
+        let grab = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item}),
+            Some(users[2]),
+        );
+        assert!(grab.is_err(), "перехват чужого предмета должен отклоняться");
+
+        // Предмет остался за первым, и лишней записи о выдаче не появилось.
+        let holder: Option<i64> = conn
+            .query_row(
+                "SELECT responsible_user_id FROM items WHERE id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder, Some(users[1]));
+        let transfers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM transfers WHERE item_id=?1",
+                params![item],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            transfers, 1,
+            "неудачная попытка не должна оставлять передачу"
+        );
+        cleanup(conn, path);
+    }
+
+    /// COUNT(*) освобождал номер вместе с удалённой передачей, и следующая
+    /// выдача получала тот же «ПП-0001».
+    #[test]
+    fn transfer_codes_are_not_reused_after_deletion() {
+        let (mut conn, path, users, ws) = test_db();
+        let first = insert_item(&conn, ws, None, false, None);
+        let second = insert_item(&conn, ws, None, false, None);
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": first}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let code_one: String = conn
+            .query_row(
+                "SELECT code FROM transfers WHERE item_id=?1",
+                params![first],
+                |r| r.get(0),
+            )
+            .unwrap();
+        conn.execute("DELETE FROM transfers WHERE item_id=?1", params![first])
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": second}),
+            Some(users[1]),
+        )
+        .unwrap();
+        let code_two: String = conn
+            .query_row(
+                "SELECT code FROM transfers WHERE item_id=?1",
+                params![second],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_ne!(
+            code_one, code_two,
+            "номер передачи не должен переиспользоваться"
+        );
+        cleanup(conn, path);
+    }
+
+    /// Голый DELETE оставлял предметы и историю с несуществующей группой.
+    #[test]
+    fn workspace_with_content_cannot_be_removed() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = insert_item(&conn, ws, None, false, None);
+
+        let attempt = dispatch(
+            &mut conn,
+            "admin.workspaces.remove",
+            &json!({"id": ws}),
+            Some(users[0]),
+        );
+        assert!(attempt.is_err(), "группу с предметами удалять нельзя");
+        let alive: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE id=?1",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(alive, 1);
+
+        conn.execute("DELETE FROM items WHERE id=?1", params![item])
+            .unwrap();
+        conn.execute(
+            "DELETE FROM history_entries WHERE workspace_id=?1",
+            params![ws],
+        )
+        .unwrap();
+        dispatch(
+            &mut conn,
+            "admin.workspaces.remove",
+            &json!({"id": ws}),
+            Some(users[0]),
+        )
+        .expect("пустая группа удаляется");
+        let members: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE workspace_id=?1",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(members, 0, "членства не должны оставаться сиротами");
         cleanup(conn, path);
     }
 
