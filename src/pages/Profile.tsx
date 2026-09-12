@@ -255,6 +255,20 @@ export default function Profile() {
   const utils = trpc.useUtils()
 
   const profileQ = trpc.profile.get.useQuery(undefined, { retry: 1 })
+  // Счётчики над кнопкой выхода. Раньше здесь стояли литералы '12' и '3',
+  // из-за чего любой человек — даже только что заведённый владелец пустой
+  // базы — видел чужую выдумку вместо своих цифр.
+  // limit: 1 — нужен только total, строки не нужны.
+  const mineCountQ = trpc.items.list.useQuery(
+    { onlyMine: true, page: 1, limit: 1 },
+    { retry: 0 },
+  )
+  const transferCountsQ = trpc.meta.transferCounts.useQuery(undefined, { retry: 0 })
+  const mineCount = mineCountQ.data?.total
+  const transferCount =
+    transferCountsQ.data === undefined
+      ? undefined
+      : transferCountsQ.data.incoming + transferCountsQ.data.outgoing
 
   // Профиль — это учётная запись, а не витрина: при ошибке показываем ошибку,
   // а не выдуманного пользователя.
@@ -559,8 +573,11 @@ export default function Profile() {
             className="mt-5 grid grid-cols-3 divide-x divide-brand-100/70"
           >
             {[
-              { v: '12', l: 'ед. на мне' },
-              { v: '3', l: 'передачи' },
+              { v: mineCount === undefined ? '—' : String(mineCount), l: 'ед. на мне' },
+              {
+                v: transferCount === undefined ? '—' : String(transferCount),
+                l: 'передачи',
+              },
               { v: profile.createdAt ? format(profile.createdAt, 'dd.MM.yy') : '—', l: 'в сервисе с' },
             ].map((s) => (
               <div key={s.l} className="px-1">
