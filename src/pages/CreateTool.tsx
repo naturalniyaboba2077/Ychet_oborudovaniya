@@ -244,6 +244,29 @@ export default function CreateTool() {
 
   const create = trpc.items.create.useMutation()
 
+  // Заведение категории прямо здесь: уходить в справочники посреди
+  // заполнения карточки неудобно, а название новой категории человек
+  // понимает именно в этот момент.
+  const [newCategory, setNewCategory] = useState<string | null>(null)
+  const canManageDictionaries = me?.roleRights?.manageDictionaries === true
+  const addCategory = trpc.admin.dictionaries.create.useMutation({
+    onSuccess: async (created) => {
+      await utils.admin.dictionaries.list.invalidate({ kind: 'categories' })
+      if (!created) {
+        // Тип допускает пустой ответ. Список уже обновлён, поэтому просто
+        // возвращаем человека к выбору, а не делаем вид, что всё хорошо.
+        setNewCategory(null)
+        setToast('Категория создана, выберите её в списке')
+        return
+      }
+      // Сразу подставляем созданную: иначе пришлось бы искать её руками.
+      setValue('categoryId', created.id, { shouldValidate: true })
+      setNewCategory(null)
+      setToast(`Категория «${created.name}» добавлена`)
+    },
+    onError: (e) => setToast(e.message || 'Не удалось добавить категорию'),
+  })
+
   const doSubmit = (values: FormValues, andMore: boolean) => {
     const costNum = values.cost ? Number(values.cost.replace(/[^\d]/g, '')) : undefined
     const internalId =
@@ -373,18 +396,65 @@ export default function CreateTool() {
                   control={control}
                   name="categoryId"
                   render={({ field }) => (
-                    <select
-                      value={field.value ?? ''}
-                      onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : undefined)}
-                      className={cn(inputCls, errors.categoryId && 'border-danger')}
-                    >
-                      <option value="">Выберите категорию</option>
-                      {(categories ?? []).map((c) => (
-                        <option key={c.id} value={c.id}>
-                          {c.name}
-                        </option>
-                      ))}
-                    </select>
+                    <>
+                      <select
+                        value={newCategory === null ? (field.value ?? '') : '__new__'}
+                        onChange={(e) => {
+                          if (e.target.value === '__new__') {
+                            setNewCategory('')
+                            return
+                          }
+                          setNewCategory(null)
+                          field.onChange(e.target.value ? Number(e.target.value) : undefined)
+                        }}
+                        className={cn(inputCls, errors.categoryId && 'border-danger')}
+                      >
+                        <option value="">Выберите категорию</option>
+                        {(categories ?? []).map((c) => (
+                          <option key={c.id} value={c.id}>
+                            {c.name}
+                          </option>
+                        ))}
+                        {canManageDictionaries && <option value="__new__">+ Новая категория</option>}
+                      </select>
+                      {newCategory !== null && (
+                        <div className="mt-2 flex gap-2">
+                          <input
+                            autoFocus
+                            value={newCategory}
+                            onChange={(e) => setNewCategory(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') {
+                                e.preventDefault()
+                                if (newCategory.trim().length >= 2) {
+                                  addCategory.mutate({ kind: 'categories', name: newCategory.trim() })
+                                }
+                              }
+                              if (e.key === 'Escape') setNewCategory(null)
+                            }}
+                            placeholder="Название категории"
+                            className={cn(inputCls, 'flex-1')}
+                          />
+                          <button
+                            type="button"
+                            disabled={newCategory.trim().length < 2 || addCategory.isPending}
+                            onClick={() =>
+                              addCategory.mutate({ kind: 'categories', name: newCategory.trim() })
+                            }
+                            className="shrink-0 rounded-xl bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-50"
+                          >
+                            {addCategory.isPending ? '…' : 'Добавить'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setNewCategory(null)}
+                            className="shrink-0 rounded-xl border border-brand-100 px-3 text-sm font-semibold text-ink-500 hover:bg-brand-50"
+                          >
+                            Отмена
+                          </button>
+                        </div>
+                      )}
+                    </>
                   )}
                 />
                 <ErrorText id="err-category" message={errors.categoryId?.message} />
