@@ -150,6 +150,117 @@ function fmtThousands(v: string): string {
 
 // ─── Главный компонент ───────────────────────────────────────────────────────
 
+/**
+ * Выпадающий список справочника с возможностью завести новую запись прямо
+ * здесь.
+ *
+ * Без этого человек упирается в обязательное поле посреди заполнения
+ * карточки и вынужден уходить в «Справочники», теряя введённое. Название
+ * новой категории или объекта он понимает именно в этот момент.
+ *
+ * `onCreate` возвращает промис: пока он не выполнен, поле заблокировано, при
+ * отказе ввод остаётся на экране вместе с набранным текстом — иначе человек
+ * потерял бы его из-за случайной ошибки сети.
+ */
+function SelectOrCreate({
+  value,
+  onChange,
+  options,
+  emptyLabel,
+  addLabel,
+  placeholder,
+  canAdd,
+  onCreate,
+  className,
+  invalid,
+}: {
+  value: number | null | undefined
+  onChange: (id: number | null) => void
+  options: { id: number; name: string }[]
+  emptyLabel: string
+  addLabel: string
+  placeholder: string
+  canAdd: boolean
+  onCreate: (name: string) => Promise<void>
+  className?: string
+  invalid?: boolean
+}) {
+  const [draft, setDraft] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const submit = async () => {
+    const name = (draft ?? '').trim()
+    if (name.length < 2 || busy) return
+    setBusy(true)
+    try {
+      await onCreate(name)
+      setDraft(null)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <>
+      <select
+        value={draft === null ? (value ?? '') : '__new__'}
+        onChange={(e) => {
+          if (e.target.value === '__new__') {
+            setDraft('')
+            return
+          }
+          setDraft(null)
+          onChange(e.target.value ? Number(e.target.value) : null)
+        }}
+        className={cn(inputCls, invalid && 'border-danger', className)}
+      >
+        <option value="">{emptyLabel}</option>
+        {options.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.name}
+          </option>
+        ))}
+        {canAdd && <option value="__new__">{addLabel}</option>}
+      </select>
+      {draft !== null && (
+        <div className="mt-2 flex gap-2">
+          <input
+            autoFocus
+            value={draft}
+            disabled={busy}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                void submit()
+              }
+              if (e.key === 'Escape') setDraft(null)
+            }}
+            placeholder={placeholder}
+            className={cn(inputCls, 'flex-1')}
+          />
+          <button
+            type="button"
+            disabled={draft.trim().length < 2 || busy}
+            onClick={() => void submit()}
+            className="shrink-0 rounded-xl bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-50"
+          >
+            {busy ? '…' : 'Добавить'}
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => setDraft(null)}
+            className="shrink-0 rounded-xl border border-brand-100 px-3 text-sm font-semibold text-ink-500 hover:bg-brand-50 disabled:opacity-50"
+          >
+            Отмена
+          </button>
+        </div>
+      )}
+    </>
+  )
+}
+
 export default function CreateTool() {
   const navigate = useNavigate()
   const utils = trpc.useUtils()
@@ -244,28 +355,52 @@ export default function CreateTool() {
 
   const create = trpc.items.create.useMutation()
 
-  // Заведение категории прямо здесь: уходить в справочники посреди
-  // заполнения карточки неудобно, а название новой категории человек
-  // понимает именно в этот момент.
-  const [newCategory, setNewCategory] = useState<string | null>(null)
-  const canManageDictionaries = me?.roleRights?.manageDictionaries === true
-  const addCategory = trpc.admin.dictionaries.create.useMutation({
-    onSuccess: async (created) => {
-      await utils.admin.dictionaries.list.invalidate({ kind: 'categories' })
-      if (!created) {
-        // Тип допускает пустой ответ. Список уже обновлён, поэтому просто
-        // возвращаем человека к выбору, а не делаем вид, что всё хорошо.
-        setNewCategory(null)
-        setToast('Категория создана, выберите её в списке')
-        return
-      }
-      // Сразу подставляем созданную: иначе пришлось бы искать её руками.
-      setValue('categoryId', created.id, { shouldValidate: true })
-      setNewCategory(null)
-      setToast(`Категория «${created.name}» добавлена`)
-    },
-    onError: (e) => setToast(e.message || 'Не удалось добавить категорию'),
-  })
+  // Справочники можно пополнять прямо из формы. Право у каждого своё:
+  // категории и бренды — manageDictionaries, склады и объекты — свои.
+  const rights = me?.roleRights
+  const canDict = rights?.manageDictionaries === true
+  const canStorages = rights?.manageStorages === true
+  const canSites = rights?.manageSites === true
+
+  const addDict = trpc.admin.dictionaries.create.useMutation()
+  const addStorage = trpc.admin.storages.create.useMutation()
+  const addSite = trpc.admin.buildingSites.create.useMutation()
+
+  /** Общий хвост: обновить список, подставить созданное, сказать человеку. */
+  const afterCreate = async (
+    created: { id: number; name?: string | null } | undefined,
+    field: 'categoryId' | 'brandId' | 'storageId' | 'buildingSiteId',
+    what: string,
+  ) => {
+    if (!created) {
+      // Тип допускает пустой ответ — не выдаём это за успех.
+      setToast(`${what} создан(а), выберите в списке`)
+      return
+    }
+    setValue(field, created.id, { shouldValidate: true })
+    setToast(`${what} «${created.name ?? ''}» добавлен(а)`)
+  }
+
+  const createCategory = async (name: string) => {
+    const created = await addDict.mutateAsync({ kind: 'categories', name })
+    await utils.admin.dictionaries.list.invalidate({ kind: 'categories' })
+    await afterCreate(created, 'categoryId', 'Категория')
+  }
+  const createBrand = async (name: string) => {
+    const created = await addDict.mutateAsync({ kind: 'brands', name })
+    await utils.admin.dictionaries.list.invalidate({ kind: 'brands' })
+    await afterCreate(created, 'brandId', 'Бренд')
+  }
+  const createStorage = async (name: string) => {
+    const created = await addStorage.mutateAsync({ name })
+    await utils.admin.storages.list.invalidate()
+    await afterCreate(created, 'storageId', 'Склад')
+  }
+  const createSite = async (name: string) => {
+    const created = await addSite.mutateAsync({ name })
+    await utils.admin.buildingSites.list.invalidate()
+    await afterCreate(created, 'buildingSiteId', 'Объект')
+  }
 
   const doSubmit = (values: FormValues, andMore: boolean) => {
     const costNum = values.cost ? Number(values.cost.replace(/[^\d]/g, '')) : undefined
@@ -396,65 +531,17 @@ export default function CreateTool() {
                   control={control}
                   name="categoryId"
                   render={({ field }) => (
-                    <>
-                      <select
-                        value={newCategory === null ? (field.value ?? '') : '__new__'}
-                        onChange={(e) => {
-                          if (e.target.value === '__new__') {
-                            setNewCategory('')
-                            return
-                          }
-                          setNewCategory(null)
-                          field.onChange(e.target.value ? Number(e.target.value) : undefined)
-                        }}
-                        className={cn(inputCls, errors.categoryId && 'border-danger')}
-                      >
-                        <option value="">Выберите категорию</option>
-                        {(categories ?? []).map((c) => (
-                          <option key={c.id} value={c.id}>
-                            {c.name}
-                          </option>
-                        ))}
-                        {canManageDictionaries && <option value="__new__">+ Новая категория</option>}
-                      </select>
-                      {newCategory !== null && (
-                        <div className="mt-2 flex gap-2">
-                          <input
-                            autoFocus
-                            value={newCategory}
-                            onChange={(e) => setNewCategory(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') {
-                                e.preventDefault()
-                                if (newCategory.trim().length >= 2) {
-                                  addCategory.mutate({ kind: 'categories', name: newCategory.trim() })
-                                }
-                              }
-                              if (e.key === 'Escape') setNewCategory(null)
-                            }}
-                            placeholder="Название категории"
-                            className={cn(inputCls, 'flex-1')}
-                          />
-                          <button
-                            type="button"
-                            disabled={newCategory.trim().length < 2 || addCategory.isPending}
-                            onClick={() =>
-                              addCategory.mutate({ kind: 'categories', name: newCategory.trim() })
-                            }
-                            className="shrink-0 rounded-xl bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover disabled:opacity-50"
-                          >
-                            {addCategory.isPending ? '…' : 'Добавить'}
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setNewCategory(null)}
-                            className="shrink-0 rounded-xl border border-brand-100 px-3 text-sm font-semibold text-ink-500 hover:bg-brand-50"
-                          >
-                            Отмена
-                          </button>
-                        </div>
-                      )}
-                    </>
+                    <SelectOrCreate
+                      value={field.value}
+                      onChange={field.onChange}
+                      options={categories ?? []}
+                      emptyLabel="Выберите категорию"
+                      addLabel="+ Новая категория"
+                      placeholder="Название категории"
+                      canAdd={canDict}
+                      onCreate={createCategory}
+                      invalid={Boolean(errors.categoryId)}
+                    />
                   )}
                 />
                 <ErrorText id="err-category" message={errors.categoryId?.message} />
@@ -466,18 +553,16 @@ export default function CreateTool() {
                   control={control}
                   name="brandId"
                   render={({ field }) => (
-                    <select
-                      value={field.value ?? ''}
-                      onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : null)}
-                      className={inputCls}
-                    >
-                      <option value="">—</option>
-                      {(brands ?? []).map((b) => (
-                        <option key={b.id} value={b.id}>
-                          {b.name}
-                        </option>
-                      ))}
-                    </select>
+                    <SelectOrCreate
+                      value={field.value}
+                      onChange={field.onChange}
+                      options={brands ?? []}
+                      emptyLabel="—"
+                      addLabel="+ Новый бренд"
+                      placeholder="Название бренда"
+                      canAdd={canDict}
+                      onCreate={createBrand}
+                    />
                   )}
                 />
               </div>
@@ -646,18 +731,17 @@ export default function CreateTool() {
                     control={control}
                     name="buildingSiteId"
                     render={({ field }) => (
-                      <select
-                        value={field.value ?? ''}
-                        onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : null)}
-                        className={cn(inputCls, 'pl-10')}
-                      >
-                        <option value="">—</option>
-                        {(sites ?? []).map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </select>
+                      <SelectOrCreate
+                        value={field.value}
+                        onChange={field.onChange}
+                        options={sites ?? []}
+                        emptyLabel="—"
+                        addLabel="+ Новый объект"
+                        placeholder="Название объекта"
+                        canAdd={canSites}
+                        onCreate={createSite}
+                        className="pl-10"
+                      />
                     )}
                   />
                 </div>
@@ -670,18 +754,17 @@ export default function CreateTool() {
                     control={control}
                     name="storageId"
                     render={({ field }) => (
-                      <select
-                        value={field.value ?? ''}
-                        onChange={(e) => field.onChange(e.target.value ? Number(e.target.value) : null)}
-                        className={cn(inputCls, 'pl-10')}
-                      >
-                        <option value="">—</option>
-                        {(storages ?? []).map((s) => (
-                          <option key={s.id} value={s.id}>
-                            {s.name}
-                          </option>
-                        ))}
-                      </select>
+                      <SelectOrCreate
+                        value={field.value}
+                        onChange={field.onChange}
+                        options={storages ?? []}
+                        emptyLabel="—"
+                        addLabel="+ Новый склад"
+                        placeholder="Название склада"
+                        canAdd={canStorages}
+                        onCreate={createStorage}
+                        className="pl-10"
+                      />
                     )}
                   />
                 </div>
