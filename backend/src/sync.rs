@@ -279,6 +279,7 @@ fn upsert_user(conn: &Connection, u: &Value) -> i64 {
                 let found: Vec<(i64, String)> = rows.filter_map(|x| x.ok()).collect();
                 if let Some((id, _)) = found.into_iter().find(|(_, p)| db::digits_only(p) == want) {
                     fill_missing_password(conn, id, password_hash);
+                    reconcile_guid(conn, id, guid);
                     return id;
                 }
             }
@@ -304,6 +305,65 @@ fn upsert_user(conn: &Connection, u: &Value) -> i64 {
         ],
     );
     conn.last_insert_rowid()
+}
+
+/// Имя сотрудника для сообщений, которые читает человек.
+fn user_name(conn: &Connection, id: Option<i64>) -> String {
+    let Some(id) = id else {
+        return "склад".to_string();
+    };
+    conn.query_row(
+        "SELECT full_name FROM users WHERE id=?1",
+        params![id],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap_or_else(|_| format!("сотрудник #{id}"))
+}
+
+/// Сводит два guid одного человека к общему значению.
+///
+/// Узлы заводят людей независимо, и один и тот же сотрудник получает разные
+/// guid: на офисном узле свой, на сервере свой. Совпадение по телефону это
+/// обнаруживает, но раньше guid так и оставались разными — а значит входящий
+/// `responsibleGuid` не опознавался, и предмет молча терял держателя.
+///
+/// Побеждает меньший по алфавиту: правило одинаково на обоих узлах, поэтому
+/// после обмена они сходятся к одному значению, а не меняются местами вечно.
+fn reconcile_guid(conn: &Connection, user_id: i64, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+    let local: String = conn
+        .query_row(
+            "SELECT COALESCE(guid,'') FROM users WHERE id=?1",
+            params![user_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_default();
+    if local == incoming {
+        return;
+    }
+    // Пустой местный guid заполняем входящим; при двух разных берём меньший
+    // по алфавиту — одно и то же правило на обоих узлах даёт им сойтись.
+    if !local.is_empty() && incoming >= local.as_str() {
+        return;
+    }
+    let winner = incoming;
+    // Чужой guid мог уже достаться кому-то ещё — тогда не трогаем, иначе
+    // нарушим уникальность и потеряем обе записи.
+    let taken: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM users WHERE guid=?1 AND id<>?2",
+            params![winner, user_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    if taken == 0 {
+        let _ = conn.execute(
+            "UPDATE users SET guid=?1 WHERE id=?2",
+            params![winner, user_id],
+        );
+    }
 }
 
 /// Проставляет хеш пароля, если локально его ещё нет. Существующий хеш
@@ -384,9 +444,16 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                         .ok()
                         .flatten();
                     if local_resp.is_some() && resp.is_some() && local_resp != resp {
+                        // Текст читает администратор, а не разработчик:
+                        // раньше сюда попадал отладочный вывод вида Some(3).
+                        let left_name = user_name(conn, local_resp);
+                        let right_name = user_name(conn, resp);
+                        let title = it
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("предмет");
                         let desc = format!(
-                            "Двое взяли один предмет офлайн: локально {:?} / входящий {:?}",
-                            local_resp, resp
+                            "«{title}» взяли двое, пока узлы были офлайн: {left_name} и {right_name}. Решите, за кем он остаётся"
                         );
                         let _ = conn.execute(
                             "INSERT INTO conflicts (workspace_id, item_id, item_guid, description, left_label, right_label, created_at)
@@ -396,14 +463,23 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                                 local_id,
                                 guid,
                                 desc,
-                                format!("user:{:?}", local_resp),
-                                format!("user:{:?}", resp),
+                                left_name,
+                                right_name,
                                 chrono::Utc::now().to_rfc3339()
                             ],
                         );
+                        // Снять предмет с обоих нужно всегда. Раньше это
+                        // висело внутри поиска статуса: в группе без
+                        // «needs-check» (а такой приходит на свежий узел
+                        // обменом) предмет оставался за одним из двоих, и
+                        // претензия второго исчезала без следа.
+                        let _ = conn.execute(
+                            "UPDATE items SET responsible_user_id=NULL WHERE id=?1",
+                            params![local_id],
+                        );
                         if let Some(st_id) = status_id(conn, ws, "needs-check") {
                             let _ = conn.execute(
-                                "UPDATE items SET responsible_user_id=NULL, status_id=?1 WHERE id=?2",
+                                "UPDATE items SET status_id=?1 WHERE id=?2",
                                 params![st_id, local_id],
                             );
                         }
@@ -414,9 +490,16 @@ pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
                         let title_ok = !incoming_title.is_empty()
                             && !incoming_title.contains('Ã')
                             && !incoming_title.contains('\u{FFFD}');
+                        // Если во входящей записи стоит держатель, которого мы
+                        // не смогли опознать, оставляем своего: записать NULL
+                        // значило бы тихо забыть, что инструмент у человека.
+                        let unresolved = resp.is_none() && resp_g.is_some_and(|g| !g.is_empty());
                         let _ = conn.execute(
-                            "UPDATE items SET title=CASE WHEN ?5 THEN COALESCE(?2,title) ELSE title END, due_at=COALESCE(?3,due_at), responsible_user_id=?4 WHERE id=?1",
-                            params![local_id, incoming_title, it.get("dueAt").and_then(|v| v.as_str()), resp, title_ok as i64],
+                            "UPDATE items SET title=CASE WHEN ?5 THEN COALESCE(?2,title) ELSE title END,
+                                              due_at=COALESCE(?3,due_at),
+                                              responsible_user_id=CASE WHEN ?6 THEN responsible_user_id ELSE ?4 END
+                             WHERE id=?1",
+                            params![local_id, incoming_title, it.get("dueAt").and_then(|v| v.as_str()), resp, title_ok as i64, unresolved as i64],
                         );
                     }
                     items_n += 1;
@@ -687,10 +770,17 @@ pub fn resolve_conflict(
     } else {
         "in-stock"
     };
+    // Решение администратора должно применяться независимо от того, заведён
+    // ли в группе нужный статус. Иначе он нажимает «разрешить», конфликт
+    // закрывается, а предмет остаётся как был — и об этом никто не узнает.
+    conn.execute(
+        "UPDATE items SET responsible_user_id=?1 WHERE id=?2",
+        params![responsible, item_id],
+    )?;
     if let Some(st) = status_id(conn, ws, slug) {
         conn.execute(
-            "UPDATE items SET responsible_user_id=?1, status_id=?2 WHERE id=?3",
-            params![responsible, st, item_id],
+            "UPDATE items SET status_id=?1 WHERE id=?2",
+            params![st, item_id],
         )?;
     }
     let _ = ledger::append(
@@ -702,7 +792,10 @@ pub fn resolve_conflict(
         None,
         None,
         None,
-        Some("Конфликт выдачи разрешён администратором"),
+        Some(&format!(
+            "Конфликт выдачи разрешён: предмет за {}",
+            user_name(conn, responsible)
+        )),
     );
     Ok(json!({"ok": true}))
 }
@@ -867,6 +960,177 @@ pub fn touch_peer_error(conn: &Connection, url: &str, err: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Готовит узел с одной группой, двумя людьми и одним предметом.
+    fn node() -> (Connection, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("meshkeeper-sync-{}.db", uuid::Uuid::new_v4()));
+        let conn = db::open(&path).expect("база");
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO workspaces (name, timezone, internal_id_prefix, created_at) VALUES ('Бригада','UTC','T-',?1)",
+            params![now],
+        )
+        .unwrap();
+        let ws = conn.last_insert_rowid();
+        for (index, name) in ["Иванов", "Петров"].iter().enumerate() {
+            conn.execute(
+                "INSERT INTO users (full_name, phone, status, created_at) VALUES (?1,?2,'active',?3)",
+                params![name, format!("+790000000{index}"), now],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO user_workspaces (user_id, workspace_id) VALUES (?1,?2)",
+                params![conn.last_insert_rowid(), ws],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO items (title, internal_id, workspace_id, created_at) VALUES ('Перфоратор','T-001',?1,?2)",
+            params![ws, now],
+        )
+        .unwrap();
+        db::fill_guids(&conn).unwrap();
+        (conn, path)
+    }
+
+    fn user_id(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT id FROM users WHERE full_name=?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Двое офлайн взяли один перфоратор. После обмена предмет обязан
+    /// сняться с обоих и лечь администратору на стол, а не достаться тому,
+    /// чей журнал пришёл последним.
+    #[test]
+    fn offline_double_checkout_becomes_a_conflict() {
+        let (left, left_path) = node();
+        let (right, right_path) = node();
+        // Правый узел получает состояние левого, чтобы guid-ы совпали.
+        import_journal(&right, &export_journal(&left));
+
+        let ivanov_left = user_id(&left, "Иванов");
+        left.execute(
+            "UPDATE items SET responsible_user_id=?1",
+            params![ivanov_left],
+        )
+        .unwrap();
+        let petrov_right = user_id(&right, "Петров");
+        right
+            .execute(
+                "UPDATE items SET responsible_user_id=?1",
+                params![petrov_right],
+            )
+            .unwrap();
+
+        let report = import_journal(&left, &export_journal(&right));
+        assert_eq!(
+            report["conflicts"].as_u64(),
+            Some(1),
+            "расхождение должно попасть в отчёт обмена"
+        );
+
+        let holder: Option<i64> = left
+            .query_row("SELECT responsible_user_id FROM items LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(holder, None, "предмет снимается с обоих до решения");
+
+        let (open, description): (i64, String) = left
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(description),'') FROM conflicts WHERE status='open'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(open, 1);
+        // Администратор читает это глазами: внутренних идентификаторов и
+        // отладочного Some(..) в тексте быть не должно.
+        assert!(
+            description.contains("Иванов") && description.contains("Петров"),
+            "в описании конфликта нет имён: {description}"
+        );
+        assert!(
+            !description.contains("Some("),
+            "в описании конфликта отладочный вывод: {description}"
+        );
+
+        cleanup(left, left_path);
+        cleanup(right, right_path);
+    }
+
+    /// Администратор оставляет предмет за одним из двоих.
+    #[test]
+    fn resolving_a_conflict_assigns_the_item_and_journals_who_got_it() {
+        let (left, left_path) = node();
+        let (right, right_path) = node();
+        import_journal(&right, &export_journal(&left));
+        left.execute(
+            "UPDATE items SET responsible_user_id=?1",
+            params![user_id(&left, "Иванов")],
+        )
+        .unwrap();
+        right
+            .execute(
+                "UPDATE items SET responsible_user_id=?1",
+                params![user_id(&right, "Петров")],
+            )
+            .unwrap();
+        import_journal(&left, &export_journal(&right));
+
+        let conflict_id: i64 = left
+            .query_row("SELECT id FROM conflicts WHERE status='open'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let winner = user_id(&left, "Петров");
+        let admin = user_id(&left, "Иванов");
+        resolve_conflict(&left, conflict_id, Some(winner), admin).expect("разрешение");
+
+        let holder: Option<i64> = left
+            .query_row("SELECT responsible_user_id FROM items LIMIT 1", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(holder, Some(winner));
+        let still_open: i64 = left
+            .query_row(
+                "SELECT COUNT(*) FROM conflicts WHERE status='open'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_open, 0);
+
+        // В журнале должно остаться, кому достался предмет, иначе разбор
+        // спустя месяц невозможен.
+        let note: String = left
+            .query_row(
+                "SELECT COALESCE(comment,'') FROM history_entries ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            note.contains("Петров"),
+            "журнал не говорит, кому достался предмет: {note}"
+        );
+
+        cleanup(left, left_path);
+        cleanup(right, right_path);
+    }
+
+    fn cleanup(conn: Connection, path: std::path::PathBuf) {
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
 
     #[test]
     fn backup_v2_round_trip() {
