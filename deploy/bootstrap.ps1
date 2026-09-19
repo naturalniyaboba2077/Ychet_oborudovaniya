@@ -26,13 +26,18 @@ param(
     [string]$AdminUser = 'root',
 
     # Имя записи в ~/.ssh/config, его потом передаём в deploy.sh.
-    [string]$Alias = 'meshkeeper'
+    [string]$Alias = 'meshkeeper',
+
+    # Имя файла ключа в ~/.ssh. Отдельный параметр нужен, потому что ключ
+    # нельзя переиспользовать вслепую: если прежний куда-то утёк, на новую
+    # машину он потащит за собой и утечку. Для нового сервера берите новое имя.
+    [string]$KeyName = 'meshkeeper_deploy'
 )
 
 $ErrorActionPreference = 'Stop'
 
 $sshDir = Join-Path $env:USERPROFILE '.ssh'
-$keyPath = Join-Path $sshDir 'meshkeeper_deploy'
+$keyPath = Join-Path $sshDir $KeyName
 $pubPath = "$keyPath.pub"
 
 if (-not (Test-Path $sshDir)) {
@@ -183,7 +188,14 @@ Host $Alias
 
 $existing = if (Test-Path $configPath) { Get-Content $configPath -Raw } else { '' }
 if ($existing -match "(?m)^Host\s+$([regex]::Escape($Alias))\s*$") {
-    Write-Host "Запись Host $Alias в ~/.ssh/config уже есть" -ForegroundColor DarkGray
+    # Запись под этим именем уже была — почти наверняка от прежнего сервера.
+    # Оставить её нельзя: алиас указывал бы на старую машину, и выкладка
+    # молча уходила бы не туда. Заменяем целиком.
+    Write-Host "Запись Host $Alias уже есть — обновляю на $Server" -ForegroundColor Yellow
+    $pattern = "(?ms)^Host\s+$([regex]::Escape($Alias))\s*$.*?(?=^Host\s|\z)"
+    $cleaned = [regex]::Replace($existing, $pattern, '')
+    Set-Content -Path $configPath -Value $cleaned.TrimEnd() -Encoding ascii
+    Add-Content -Path $configPath -Value $entry -Encoding ascii
 }
 else {
     # ascii, а не utf8: PowerShell 5.1 добавил бы BOM, и ssh не понял бы файл.
