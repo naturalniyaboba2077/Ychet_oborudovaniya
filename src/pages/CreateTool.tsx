@@ -318,10 +318,6 @@ export default function CreateTool() {
   }, [nextNum, getValues, setValue])
 
   useEffect(() => {
-    if (me && !getValues('responsibleUserId')) setValue('responsibleUserId', me.id)
-  }, [me, getValues, setValue])
-
-  useEffect(() => {
     if (statuses?.length && !getValues('statusId')) {
       const inStock = statuses.find((s) => s.slug === 'in-stock') ?? statuses[0]
       setValue('statusId', inStock.id)
@@ -439,7 +435,6 @@ export default function CreateTool() {
             setToast(`Инструмент ${item?.internalId ?? ''} создан — можно добавить следующий`)
             requestAnimationFrame(() => setFocus('title'))
             // заново подставить дефолты
-            if (me) setValue('responsibleUserId', me.id)
             if (statuses?.length) {
               const inStock = statuses.find((s) => s.slug === 'in-stock') ?? statuses[0]
               setValue('statusId', inStock.id)

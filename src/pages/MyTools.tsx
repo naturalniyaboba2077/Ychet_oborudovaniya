@@ -33,7 +33,7 @@ import type { AppRouter } from '../../api/router'
 import { trpc } from '@/providers/trpc'
 import { askStatusReason, statusNeedsReason } from '@/lib/status-reason'
 import { cn } from '@/lib/utils'
-import { QrBadge, MaterialBadge } from '@/components/StatusBadge'
+import { QrBadge, MaterialBadge, StatusDot, StatusBadge } from '@/components/StatusBadge'
 
 // ─── Типы из tRPC-контракта ─────────────────────────────────────────────────
 
@@ -118,30 +118,6 @@ function CountUp({ value, className }: { value: number; className?: string }) {
 }
 
 /** Цветная точка + подпись статуса из справочника (color из API) */
-function ItemStatusDot({ item, className }: { item: Item; className?: string }) {
-  const s = item.status
-  if (!s) return <span className={cn('text-xs text-ink-300', className)}>—</span>
-  return (
-    <span className={cn('inline-flex items-center gap-1.5 text-xs font-semibold', className)} style={{ color: s.color }}>
-      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: s.color }} />
-      {s.name}
-    </span>
-  )
-}
-
-/** Статусный бейдж pill (uppercase, цветная пара фон/текст из API) */
-function ItemStatusBadge({ item, className }: { item: Item; className?: string }) {
-  const s = item.status
-  if (!s) return <span className={cn('text-xs text-ink-300', className)}>—</span>
-  return (
-    <span
-      className={cn('inline-flex items-center rounded-full px-2.5 py-0.5 text-caption', className)}
-      style={{ background: s.bg, color: s.color }}
-    >
-      {s.name}
-    </span>
-  )
-}
 
 // ─── Чекбокс фильтра ─────────────────────────────────────────────────────────
 
@@ -307,7 +283,7 @@ function MyToolCard({
           <span className="font-mono-num text-ink-500">
             <Highlight text={item.internalId} query={query} />
           </span>
-          <ItemStatusDot item={item} />
+          <StatusDot status={item.status} />
         </div>
         <h3 className="text-[15px] leading-[22px] font-semibold text-ink-900 line-clamp-2 min-h-[44px]">
           <Highlight text={item.title} query={query} />
@@ -656,7 +632,7 @@ function MyToolsTable({
                 </td>
                 <td className="px-3 text-[13px] text-ink-500 whitespace-nowrap">{item.category?.name ?? '—'}</td>
                 <td className="px-3">
-                  <ItemStatusBadge item={item} />
+                  <StatusBadge status={item.status} />
                 </td>
                 <td className="px-3 text-[13px] text-ink-500 whitespace-nowrap">{item.buildingSite?.name ?? '—'}</td>
                 <td className="px-3 text-[13px] text-ink-500 whitespace-nowrap">{item.storage?.name ?? '—'}</td>

@@ -214,6 +214,27 @@ pub(crate) fn items_create_atomic(
         Some("Инструмент добавлен в каталог"),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    // Карточку можно завести сразу с ответственным. Это не проходит через
+    // выдачу, поэтому без отдельной записи предмет числился бы за человеком,
+    // а история об этом молчала — и разобрать потом, откуда он у него, было
+    // бы нечем.
+    if let Some(holder) = i64v(input, "responsibleUserId") {
+        let holder_name = jsn::user_public(conn, holder)
+            .and_then(|u| u["fullName"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("сотрудник #{holder}"));
+        ledger::append(
+            conn,
+            ws,
+            uid,
+            Some(id),
+            "transfer_receive",
+            Some("Склад"),
+            Some(&holder_name),
+            None,
+            Some("Ответственный назначен при создании карточки"),
+        )
+        .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    }
     jsn::item_json(conn, id, true).ok_or_else(|| ApiError::bad("не создан"))
 }
 

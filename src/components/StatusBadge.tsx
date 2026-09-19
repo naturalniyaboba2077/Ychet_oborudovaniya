@@ -1,27 +1,48 @@
-import { statusById } from '@/lib/mock-data'
-import type { ToolStatus } from '@/lib/mock-data'
 import { cn } from '@/lib/utils'
 
-/** Цветная точка + подпись статуса (12px/600, цвет статуса) */
-export function StatusDot({ status, className }: { status: ToolStatus; className?: string }) {
-  const s = statusById(status)
+/**
+ * Статус предмета в том виде, в каком его отдаёт сервер.
+ *
+ * Названия и цвета статусов настраиваются в каждой группе своими, поэтому
+ * рисовать их по зашитому в клиент списку нельзя: свой статус показался бы
+ * чужим именем и чужим цветом. Раньше здесь так и было — список брался из
+ * mock-data, — но страницы этим не пользовались и рисовали статус сами,
+ * каждая по-своему. Общий вид живёт здесь.
+ */
+export type ApiStatus = { name: string; color: string; bg: string } | null | undefined
+
+/** Цветная точка + подпись статуса. */
+export function StatusDot({ status, className }: { status: ApiStatus; className?: string }) {
+  if (!status) return <span className={cn('text-xs text-ink-300', className)}>—</span>
   return (
-    <span className={cn('inline-flex items-center gap-1.5 text-xs font-semibold', className)} style={{ color: s.color }}>
-      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: s.color }} />
-      {s.name}
+    <span
+      className={cn('inline-flex items-center gap-1.5 text-xs font-semibold', className)}
+      style={{ color: status.color }}
+    >
+      <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: status.color }} />
+      {status.name}
     </span>
   )
 }
 
-/** Статусный бейдж pill (uppercase, цветная пара фон/текст) */
-export function StatusBadge({ status, className }: { status: ToolStatus; className?: string }) {
-  const s = statusById(status)
+/** Статусный бейдж-пилюля: цветная пара фон/текст из настроек группы. */
+export function StatusBadge({
+  status,
+  className,
+  emptyClassName = 'text-xs text-ink-300',
+}: {
+  status: ApiStatus
+  className?: string
+  /** Размер прочерка отличается в карточке и в списке. */
+  emptyClassName?: string
+}) {
+  if (!status) return <span className={cn(emptyClassName, className)}>—</span>
   return (
     <span
       className={cn('inline-flex items-center rounded-full px-2.5 py-0.5 text-caption', className)}
-      style={{ background: s.bg, color: s.color }}
+      style={{ background: status.bg, color: status.color }}
     >
-      {s.name}
+      {status.name}
     </span>
   )
 }

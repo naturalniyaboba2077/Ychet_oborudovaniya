@@ -1418,6 +1418,62 @@ mod tests {
         cleanup(conn, path);
     }
 
+    /// Карточку можно завести сразу с ответственным, минуя выдачу. Тогда в
+    /// истории обязана быть запись, иначе предмет числится за человеком, а
+    /// объяснить это нечем.
+    #[test]
+    fn item_created_with_a_holder_is_journalled() {
+        let (mut conn, path, users, ws) = test_db();
+        dispatch(
+            &mut conn,
+            "items.create",
+            &json!({
+                "title": "Перфоратор",
+                "workspaceId": ws,
+                "responsibleUserId": users[1],
+            }),
+            Some(users[0]),
+        )
+        .expect("создание с ответственным");
+
+        let notes: Vec<String> = conn
+            .prepare("SELECT COALESCE(comment,'') FROM history_entries ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|x| x.ok())
+            .collect();
+        assert!(
+            notes.iter().any(|n| n.contains("Ответственный назначен")),
+            "нет записи о том, что предмет сразу ушёл человеку: {notes:?}"
+        );
+        cleanup(conn, path);
+    }
+
+    /// Без явного выбора предмет остаётся ничей: регистрация карточки не то
+    /// же самое, что выдача.
+    #[test]
+    fn item_created_without_a_holder_stays_free() {
+        let (mut conn, path, users, ws) = test_db();
+        let created = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"title": "Шуруповёрт", "workspaceId": ws}),
+            Some(users[0]),
+        )
+        .expect("создание без ответственного");
+        let id = created["id"].as_i64().unwrap();
+        let holder: Option<i64> = conn
+            .query_row(
+                "SELECT responsible_user_id FROM items WHERE id=?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(holder, None);
+        cleanup(conn, path);
+    }
+
     #[test]
     fn viewer_invite_grants_read_only_membership() {
         let (mut conn, path, users, ws) = test_db();

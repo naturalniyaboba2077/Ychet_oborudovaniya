@@ -41,6 +41,7 @@ import {
 import { QRCodeCanvas, QRCodeSVG } from 'qrcode.react'
 import { format } from 'date-fns'
 import { ru } from 'date-fns/locale'
+import { StatusBadge } from '@/components/StatusBadge'
 import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
 import { askStatusReason, itemCirculates, statusNeedsReason } from '@/lib/status-reason'
@@ -220,18 +221,6 @@ function IconButton({
 
 // ─── Статус-бейдж по данным API (slug/color/bg) ──────────────────────────────
 
-function ApiStatusBadge({ status, className }: { status: { name: string; color: string; bg: string } | null | undefined; className?: string }) {
-  if (!status) return <span className={cn('text-sm text-ink-300', className)}>—</span>
-  return (
-    <span
-      className={cn('inline-flex items-center rounded-full px-2.5 py-0.5 text-caption', className)}
-      style={{ background: status.bg, color: status.color }}
-    >
-      {status.name}
-    </span>
-  )
-}
-
 // ─── Секция 2. Фотогалерея (embla + lightbox с зумом) ────────────────────────
 
 function PhotoGallery({
@@ -319,7 +308,7 @@ function PhotoGallery({
               QR
             </span>
           )}
-          <ApiStatusBadge status={status} />
+          <StatusBadge emptyClassName="text-sm text-ink-300" status={status} />
         </div>
         {photos.length > 0 && (
           <div className="absolute left-3 bottom-3 pointer-events-none">
@@ -1337,7 +1326,7 @@ function FieldsCard({
               ))}
             </EditSelect>
           ) : (
-            <ApiStatusBadge status={item.status} />
+            <StatusBadge emptyClassName="text-sm text-ink-300" status={item.status} />
           )}
         </Field>
         <Field label="Срок возврата" flash={flash}>
@@ -1724,7 +1713,7 @@ function SimilarTools({ item }: { item: ItemFull }) {
                     {t.title}
                   </div>
                   <div className="mt-1">
-                    <ApiStatusBadge status={t.status} />
+                    <StatusBadge emptyClassName="text-sm text-ink-300" status={t.status} />
                   </div>
                 </div>
               </Link>
@@ -2030,7 +2019,7 @@ export default function ToolCard() {
                 </h1>
               )}
               <div className="mt-2 flex flex-wrap items-center gap-2">
-                <ApiStatusBadge status={item.status} />
+                <StatusBadge emptyClassName="text-sm text-ink-300" status={item.status} />
                 {item.responsible && responsibleSince && (
                   <span className="text-[13px] text-ink-500">
                     на ответственном хранении у {item.responsible.fullName} с {fmtDate(responsibleSince)}
