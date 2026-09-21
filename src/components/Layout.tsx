@@ -6,8 +6,17 @@ import { trpc } from '@/providers/trpc'
 
 export default function Layout() {
   const meQ = trpc.auth.me.useQuery(undefined, { retry: 0 })
+  // Аккаунт может существовать без организации: их создание — отдельный шаг.
+  // Пускать такого человека в каталог бессмысленно, там нечего показывать.
+  const wsQ = trpc.meta.workspaces.useQuery(undefined, {
+    enabled: !!meQ.data,
+    retry: 0,
+  })
   if (!meQ.data && !meQ.isLoading) {
     return <Navigate to="/login" replace />
+  }
+  if (meQ.data && wsQ.data && wsQ.data.length === 0) {
+    return <Navigate to="/start" replace />
   }
 
   return (

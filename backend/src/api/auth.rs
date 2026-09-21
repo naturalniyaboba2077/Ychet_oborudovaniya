@@ -35,9 +35,10 @@ pub(crate) fn auth_options(conn: &Connection) -> ApiResult {
     let users: i64 = conn
         .query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))
         .unwrap_or(0);
-    let open = std::env::var("MESHKEEPER_OPEN_REGISTRATION").as_deref() == Ok("1");
     Ok(json!({
-        "registrationOpen": users == 0 || open,
+        // Аккаунт заводит любой: организация создаётся отдельным шагом, и
+        // пока её нет, учётная запись пустая — смотреть в ней нечего.
+        "registrationOpen": true,
         "bootstrap": users == 0,
         "demoLogin": std::env::var("MESHKEEPER_DEMO_LOGIN").as_deref() == Ok("1"),
         "googleEnabled": crate::google::enabled(),
@@ -112,11 +113,44 @@ pub fn google_finish(
         }
         return Ok(link_to);
     }
-    // Новый человек. Без приглашения внутрь нельзя — регистрация закрытая.
-    let token = pending
-        .invite_token
-        .as_deref()
-        .ok_or_else(|| ApiError::unauth("Нужно приглашение: свободной регистрации нет"))?;
+    // Новый человек без приглашения. Аккаунт завести можно — организация
+    // создаётся отдельным шагом, и пока её нет, смотреть в учётной записи
+    // нечего. Телефон всё равно нужен: в системе учёта именно он связывает
+    // карточку с живым человеком, а Google его не сообщает, поэтому форма
+    // спрашивает номер до перехода.
+    let Some(token) = pending.invite_token.as_deref() else {
+        let phone = pending
+            .phone
+            .as_deref()
+            .ok_or_else(|| ApiError::bad("Укажите телефон — без него учётную запись не завести"))?;
+        if find_user_phone(conn, phone).is_some() {
+            return Err(ApiError::conflict(
+                "Этот телефон уже зарегистрирован. Войдите с ним и привяжите Google в профиле.",
+            ));
+        }
+        let full_name = pending
+            .full_name
+            .as_deref()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or(identity.name.as_str());
+        if full_name.trim().is_empty() {
+            return Err(ApiError::bad("Введите имя"));
+        }
+        conn.execute(
+            "INSERT INTO users (full_name, phone, status, role_rights, email, google_sub, created_at)
+             VALUES (?1,?2,'active',?3,?4,?5,?6)",
+            params![
+                full_name,
+                phone,
+                db::default_rights().to_string(),
+                identity.email,
+                identity.sub,
+                now()
+            ],
+        )
+        .map_err(|e| ApiError::conflict(e.to_string()))?;
+        return Ok(conn.last_insert_rowid());
+    };
     let invite = invite_by_token(conn, token)?;
     ensure_invite_usable(&invite)?;
     // Телефон занят. Молча привязать сюда Google нельзя: приглашение есть у
@@ -358,15 +392,13 @@ pub(crate) fn seed_workspace_defaults(
     Ok(())
 }
 
+/// Заводит учётную запись — и только её.
+///
+/// Организация создаётся отдельным шагом: человек сначала получает аккаунт,
+/// а потом решает, завести свою группу или вступить в чужую по приглашению.
+/// Раньше эти два действия были склеены, и войти через Google было нельзя в
+/// принципе: Google не сообщает ни телефона, ни названия организации.
 pub(crate) fn auth_register(conn: &Connection, input: &Value) -> ApiResult {
-    let users: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
-    if users > 0 && std::env::var("MESHKEEPER_OPEN_REGISTRATION").as_deref() != Ok("1") {
-        return Err(ApiError::new(
-            "FORBIDDEN",
-            403,
-            "Открытая регистрация отключена; используйте приглашение",
-        ));
-    }
     let full_name = s(input, "fullName").ok_or_else(|| ApiError::bad("Введите имя"))?;
     let phone = s(input, "phone").ok_or_else(|| ApiError::bad("Введите телефон"))?;
     let password = s(input, "password").ok_or_else(|| ApiError::bad("Введите пароль"))?;
@@ -378,28 +410,82 @@ pub(crate) fn auth_register(conn: &Connection, input: &Value) -> ApiResult {
             "Этот телефон уже зарегистрирован. Войдите с тем же номером и паролем.",
         ));
     }
-    let ws_name = s(input, "workspaceName").unwrap_or_else(|| "Моя группа".into());
+    // Прав пока никаких: они появятся вместе с группой — своей или чужой.
+    conn.execute(
+        "INSERT INTO users (full_name, phone, status, password_hash, role_rights, created_at)
+         VALUES (?1,?2,'active',?3,?4,?5)",
+        params![
+            full_name,
+            phone,
+            hash_password(&password),
+            db::default_rights().to_string(),
+            now()
+        ],
+    )
+    .map_err(|e| ApiError::conflict(e.to_string()))?;
+    let uid = conn.last_insert_rowid();
+    Ok(jsn::user_public(conn, uid).unwrap())
+}
+
+/// Создаёт организацию для уже вошедшего человека и делает его владельцем.
+///
+/// Отдельная процедура, а не admin.workspaces.create: у того требуется право
+/// manageWorkspaces, которого у новичка неоткуда взяться — он ещё никуда не
+/// входит.
+pub(crate) fn auth_create_workspace(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let name = s(input, "name")
+        .map(|v| v.trim().to_string())
+        .filter(|v| v.chars().count() >= 2)
+        .ok_or_else(|| ApiError::bad("Введите название организации"))?;
     let sync_url = s(input, "syncUrl");
     conn.execute(
-        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url) VALUES (?1,?2,'ВН-',?3,?4,?5)",
-        params![ws_name, "Europe/Moscow", "Создано при регистрации", now(), sync_url],
-    ).map_err(|e| ApiError::bad(e.to_string()))?;
+        "INSERT INTO workspaces (name, timezone, internal_id_prefix, comment, created_at, sync_url)
+         VALUES (?1,?2,'ВН-',?3,?4,?5)",
+        params![
+            name,
+            s(input, "timezone").unwrap_or_else(|| "Europe/Moscow".into()),
+            "Создано владельцем",
+            now(),
+            sync_url
+        ],
+    )
+    .map_err(|e| ApiError::bad(e.to_string()))?;
     let ws = conn.last_insert_rowid();
     if let Some(url) = sync_url {
         crate::sync::add_peer(conn, &url, Some("relay"), None);
     }
-    conn.execute(
-        "INSERT INTO users (full_name, position, phone, status, password_hash, role_rights, created_at)
-         VALUES (?1,'Владелец',?2,'active',?3,?4,?5)",
-        params![full_name, phone, hash_password(&password), db::owner_rights().to_string(), now()],
-    ).map_err(|e| ApiError::conflict(e.to_string()))?;
-    let uid = conn.last_insert_rowid();
+    // Владелец своей группы получает полные права в ней. Права хранятся в
+    // членстве, а не в человеке: в чужой группе он может быть кем угодно.
     conn.execute(
         "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
         params![uid, ws, db::owner_rights().to_string()],
     )?;
+    // Глобальные права трогаем только у новичка, заводящего первую группу.
+    // В одном аккаунте можно состоять в нескольких организациях с разными
+    // ролями: владелец своей и простой работник в чужой. Если переписывать
+    // общее поле при каждом создании, роль из одной группы протекала бы в
+    // другую. Роль живёт в членстве — там её и выставили строкой выше.
+    let first_group: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1",
+        params![uid],
+        |r| r.get(0),
+    )?;
+    if first_group <= 1 {
+        conn.execute(
+            "UPDATE users SET position=COALESCE(NULLIF(position,''),'Владелец'), role_rights=?1 WHERE id=?2",
+            params![db::owner_rights().to_string(), uid],
+        )?;
+    }
     seed_workspace_defaults(conn, ws, uid)?;
-    Ok(jsn::user_public(conn, uid).unwrap())
+    let mut me = jsn::user_public(conn, uid).unwrap();
+    me["workspaceId"] = json!(ws);
+    me["joinedWorkspace"] = jsn::workspace_json(conn, ws).unwrap_or(json!({}));
+    Ok(me)
 }
 
 pub(crate) struct Invite {

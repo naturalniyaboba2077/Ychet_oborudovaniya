@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router'
-import { Search, Bell, ChevronDown, Check, X, QrCode } from 'lucide-react'
+import { Search, Bell, ChevronDown, Check, X, QrCode, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
 
@@ -85,6 +85,16 @@ export default function TopBar() {
                 {ws.id === workspace?.id && <Check size={16} className="text-brand-600" />}
               </button>
             ))}
+            {/* В одном аккаунте можно состоять в нескольких организациях, и
+                роль в каждой своя. Отсюда же заводится следующая. */}
+            <Link
+              to="/start"
+              onClick={() => setWsOpen(false)}
+              className="mt-1 flex w-full items-center gap-2.5 rounded-xl border-t border-brand-100 px-3 py-2.5 text-sm font-semibold text-brand-600 transition-colors hover:bg-brand-50/60"
+            >
+              <Plus size={16} />
+              Добавить организацию
+            </Link>
           </div>
         )}
       </div>

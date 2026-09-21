@@ -2,6 +2,7 @@ import { Routes, Route } from 'react-router'
 import { lazy, Suspense } from 'react'
 import { StoreProvider } from '@/lib/store'
 import Layout from '@/components/Layout'
+import Onboarding from '@/pages/Onboarding'
 
 const Catalog = lazy(() => import('@/pages/Catalog'))
 const MyTools = lazy(() => import('@/pages/MyTools'))
@@ -35,6 +36,7 @@ export default function App() {
         <Routes>
           <Route path="/login" element={<Auth />} />
           <Route path="/join" element={<Join />} />
+          <Route path="/start" element={<Onboarding />} />
           <Route element={<Layout />}>
             <Route index element={<Catalog />} />
             <Route path="scan" element={<Scan />} />

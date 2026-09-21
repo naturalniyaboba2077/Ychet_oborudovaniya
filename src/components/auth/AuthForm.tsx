@@ -8,12 +8,9 @@ import {
   Eye,
   EyeOff,
   UserRound,
-  Building2,
-  Globe2,
   Info,
   Loader2,
   Check,
-  ChevronDown,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
@@ -678,15 +675,6 @@ function LoginTab() {
 }
 
 /* ═══════════════ Таб «Регистрация» ═══════════════ */
-const TIMEZONES = [
-  'Калининград, UTC+2',
-  'Москва, UTC+3',
-  'Самара, UTC+4',
-  'Екатеринбург, UTC+5',
-  'Новосибирск, UTC+7',
-  'Владивосток, UTC+10',
-]
-
 function RegisterTab() {
   const navigate = useNavigate()
   const utils = trpc.useUtils()
@@ -695,9 +683,6 @@ function RegisterTab() {
   const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
-  const [workspace, setWorkspace] = useState('')
-  const [syncUrl, setSyncUrl] = useState('')
-  const [timezone, setTimezone] = useState('Москва, UTC+3')
   const [agree, setAgree] = useState(false)
   const [state, setState] = useState<SubmitState>('idle')
   const [errors, setErrors] = useState<Record<string, string | undefined>>({})
@@ -710,7 +695,6 @@ function RegisterTab() {
     if (!name.trim()) next.name = 'Введите имя и фамилию'
     if (phoneDigits(phone).length !== 11) next.phone = 'Введите телефон полностью'
     if (password.length < 10) next.password = 'Минимум 10 символов'
-    if (!workspace.trim()) next.workspace = 'Введите название рабочего пространства'
     if (!agree) next.agree = 'Нужно согласие с условиями'
     setErrors(next)
     if (Object.keys(next).length > 0) {
@@ -723,9 +707,6 @@ function RegisterTab() {
         fullName: name.trim(),
         phone,
         password,
-        workspaceName: workspace.trim(),
-        timezone,
-        syncUrl: syncUrl.trim() || undefined,
       })
       await utils.invalidate()
       setState('success')
@@ -792,53 +773,6 @@ function RegisterTab() {
         <PasswordStrength password={password} />
       </Field>
 
-      <Field
-        index={3}
-        label="Название рабочего пространства"
-        required
-        error={errors.workspace}
-        shake={!!errors.workspace}
-        hint={errors.workspace ? undefined : 'Компания или бригада. Сменить можно позже'}
-      >
-        <div className="relative">
-          <Building2
-            size={18}
-            className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-ink-300"
-          />
-          <input
-            type="text"
-            value={workspace}
-            onChange={(e) => setWorkspace(e.target.value)}
-            placeholder="ООО «СтройМонтаж»"
-            className={inputClass(!!errors.workspace)}
-          />
-        </div>
-      </Field>
-
-      <Field index={4} label="Часовой пояс" shake={false}>
-        <div className="relative">
-          <Globe2
-            size={18}
-            className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-ink-300"
-          />
-          <select
-            value={timezone}
-            onChange={(e) => setTimezone(e.target.value)}
-            className={cn(inputClass(false), 'appearance-none pr-10')}
-          >
-            {TIMEZONES.map((tz) => (
-              <option key={tz} value={tz}>
-                {tz}
-              </option>
-            ))}
-          </select>
-          <ChevronDown
-            size={16}
-            className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-ink-300"
-          />
-        </div>
-      </Field>
-
       <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={5}>
         <Checkbox
           checked={agree}
@@ -856,21 +790,11 @@ function RegisterTab() {
       </motion.div>
 
       <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={6}>
-        <Field
-          index={5}
-          label="Дополнительный сервер (необязательно)"
-          hint="Можно оставить пустым: этот телефон сам ведёт учёт и делится журналом по Wi‑Fi"
-          shake={false}
-        >
-          <input
-            value={syncUrl}
-            onChange={(e) => setSyncUrl(e.target.value)}
-            placeholder="https://sync.example.com"
-            className={inputClass(false, false)}
-          />
-        </Field>
-
-        <SubmitButton state={state}>Создать организацию</SubmitButton>
+        <SubmitButton state={state}>Создать аккаунт</SubmitButton>
+        <p className="mt-3 text-center text-[13px] leading-5 text-ink-500">
+          Организацию создадите следующим шагом — или вступите в чужую по
+          приглашению.
+        </p>
       </motion.div>
     </form>
   )
@@ -930,7 +854,7 @@ export default function AuthForm() {
     ? [
         { id: 'join' as const, label: 'QR-код' },
         { id: 'login' as const, label: 'Вход' },
-        { id: 'register' as const, label: 'Создать группу' },
+        { id: 'register' as const, label: 'Создать аккаунт' },
       ]
     : [
         { id: 'join' as const, label: 'QR-код' },

@@ -24,6 +24,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BINARY="$ROOT/dist/server/meshkeeper-node"
 PUBLIC="$ROOT/dist/public"
 
+# Адрес, который слушает узел. Наружу он не смотрит — его публикует обратный
+# прокси, — но порт приходится задавать: 8080 на машине может быть уже занят
+# чужим сервисом, и тогда MeshKeeper просто не поднимется.
+BIND="${MESHKEEPER_BIND:-127.0.0.1:8080}"
+
 if [[ ! -f "$BINARY" ]]; then
   echo "Нет $BINARY. Соберите Linux-бинарник:" >&2
   echo "  cargo build --release --manifest-path backend/Cargo.toml --target x86_64-unknown-linux-gnu" >&2
@@ -44,7 +49,15 @@ echo "→ Загружаю новую версию во временный ка�
 ssh "$TARGET" 'rm -rf /opt/meshkeeper/incoming && mkdir -p /opt/meshkeeper/incoming'
 scp -q "$BINARY" "$TARGET:/opt/meshkeeper/incoming/meshkeeper-node"
 scp -qr "$PUBLIC" "$TARGET:/opt/meshkeeper/incoming/public"
-scp -q "$ROOT/deploy/meshkeeper.service" "$TARGET:/opt/meshkeeper/incoming/meshkeeper.service"
+# Юнит подставляем с нужным адресом, а не шлём как есть.
+UNIT="$(mktemp)"
+trap 'rm -f "$UNIT"' EXIT
+sed "s|^Environment=MESHKEEPER_BIND=.*|Environment=MESHKEEPER_BIND=$BIND|"   "$ROOT/deploy/meshkeeper.service" > "$UNIT"
+grep -q "MESHKEEPER_BIND=$BIND" "$UNIT" || {
+  echo "Не удалось подставить адрес $BIND в юнит" >&2
+  exit 1
+}
+scp -q "$UNIT" "$TARGET:/opt/meshkeeper/incoming/meshkeeper.service"
 
 echo "→ Переключаю сервис"
 # Единственная команда, разрешённая деплой-пользователю через sudo. Она ставится

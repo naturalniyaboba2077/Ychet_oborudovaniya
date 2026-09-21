@@ -2,10 +2,31 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { createRouter, publicQuery } from "./middleware";
 import { findUserById, findUserByPhone, findUsers, createUser, updateUser } from "./queries/users";
-import { createWorkspace, getDefaultWorkspaceId } from "./queries/catalog";
+import { createWorkspace } from "./queries/catalog";
 import { requireMe } from "./auth";
 import { hashPassword, verifyPassword, publicUser } from "./lib/password";
 import type { RoleRights } from "@db/schema";
+
+// Права новичка: он видит и берёт инструмент, но никем не управляет.
+// Зеркало db::default_rights() в Rust — расхождение поймает check:api.
+const DEFAULT_RIGHTS: RoleRights = {
+  viewItems: true,
+  createItems: true,
+  editItems: true,
+  deleteItems: false,
+  transferItems: true,
+  acceptTransfers: true,
+  writeOff: false,
+  replenish: true,
+  inventory: true,
+  viewHistory: true,
+  viewReports: true,
+  manageUsers: false,
+  manageWorkspaces: false,
+  manageStorages: false,
+  manageSites: false,
+  manageDictionaries: false,
+};
 
 const OWNER_RIGHTS: RoleRights = {
   viewItems: true,
@@ -90,9 +111,6 @@ export const authRouter = createRouter({
         fullName: z.string().min(2),
         phone: z.string().min(5),
         password: z.string().min(10),
-        workspaceName: z.string().min(1),
-        timezone: z.string().optional(),
-        syncUrl: z.string().optional(),
       }),
     )
     .mutation(async ({ input, ctx }) => {
@@ -103,26 +121,17 @@ export const authRouter = createRouter({
           message: "Этот телефон уже зарегистрирован. Войдите с тем же номером и паролем.",
         });
       }
-      let workspaceId: number;
-      try {
-        const ws = await createWorkspace({
-          name: input.workspaceName.trim(),
-          timezone: timezoneFromLabel(input.timezone ?? "Москва"),
-          internalIdPrefix: "ВН-",
-          comment: "Создано при регистрации",
-        });
-        workspaceId = ws?.id ?? (await getDefaultWorkspaceId());
-      } catch {
-        workspaceId = await getDefaultWorkspaceId();
-      }
+      // Организация здесь больше не создаётся: это отдельный шаг
+      // auth.createWorkspace. Аккаунт рождается пустым, и человек сам решает,
+      // завести свою группу или вступить в чужую по приглашению.
       let created;
       try {
         created = await createUser({
           fullName: input.fullName.trim(),
           phone: input.phone.trim(),
           passwordHash: hashPassword(input.password),
-          roleRights: OWNER_RIGHTS,
-          workspaceIds: [workspaceId],
+          roleRights: DEFAULT_RIGHTS,
+          workspaceIds: [],
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : "";
@@ -164,6 +173,36 @@ export const authRouter = createRouter({
   // Заводит попытку входа через Google и отдаёт адрес, куда уходит браузер.
   // Телефон и имя принимаются здесь, потому что Google их не сообщает, а в
   // системе учёта телефон обязателен.
+  // Создаёт организацию для уже вошедшего человека и делает его владельцем.
+  // Отдельно от register: аккаунт и организация — разные шаги, и в одном
+  // аккаунте можно состоять в нескольких группах с разными ролями.
+  createWorkspace: publicQuery
+    .input(
+      z.object({
+        name: z.string().min(2),
+        timezone: z.string().optional(),
+        syncUrl: z.string().optional(),
+      }),
+    )
+    .mutation(async ({ input }) => {
+      await createWorkspace({
+        name: input.name.trim(),
+        timezone: timezoneFromLabel(input.timezone ?? "Москва"),
+        internalIdPrefix: "ВН-",
+        comment: "Создано владельцем",
+      });
+      return {
+        id: 0,
+        fullName: "",
+        phone: "",
+        position: null as string | null,
+        avatarUrl: null as string | null,
+        status: "active",
+        workspaceId: 0,
+        roleRights: OWNER_RIGHTS,
+      };
+    }),
+
   googleBegin: publicQuery
     .input(
       z.object({

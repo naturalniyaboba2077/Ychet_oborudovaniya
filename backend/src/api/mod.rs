@@ -680,6 +680,7 @@ fn dispatch_inner(
         "auth.googleBegin" => auth_google_begin(conn, input, user_id),
         "auth.login" => auth_login(conn, input),
         "auth.register" => auth_register(conn, input),
+        "auth.createWorkspace" => auth_create_workspace(conn, input, user_id),
         "auth.join" => auth_join(conn, input, user_id),
         "auth.joinRegister" => auth_join_register(conn, input),
         "auth.logout" => Ok(json!({"ok": true})),
@@ -1259,24 +1260,52 @@ mod tests {
         cleanup(conn, path);
     }
 
+    /// Аккаунт и организация — разные шаги, поэтому учётную запись через
+    /// Google можно завести и без приглашения. Телефон при этом обязателен:
+    /// Google его не сообщает, а в системе учёта именно он связывает карточку
+    /// с живым человеком.
     #[test]
-    fn google_without_invite_is_refused_for_unknown_person() {
+    fn google_without_invite_creates_an_account_but_demands_a_phone() {
         let (conn, path, _users, _ws) = test_db();
-        let attempt = google_finish(
+        let who = crate::google::Identity {
+            sub: "novyy".into(),
+            email: "novyy@example.com".into(),
+            name: "Новый".into(),
+        };
+
+        let without_phone = google_finish(
             &conn,
-            &crate::google::Identity {
-                sub: "nikto".into(),
-                email: "nikto@example.com".into(),
-                name: "Никто".into(),
-            },
+            &who,
             &crate::google::Pending {
                 invite_token: None,
-                phone: Some("+79995553333".into()),
-                full_name: Some("Никто".into()),
+                phone: None,
+                full_name: Some("Новый".into()),
                 link_user_id: None,
             },
         );
-        assert!(attempt.is_err(), "свободной регистрации быть не должно");
+        assert!(without_phone.is_err(), "без телефона заводить нельзя");
+
+        let uid = google_finish(
+            &conn,
+            &who,
+            &crate::google::Pending {
+                invite_token: None,
+                phone: Some("+79995553333".into()),
+                full_name: Some("Новый".into()),
+                link_user_id: None,
+            },
+        )
+        .expect("с телефоном аккаунт заводится");
+
+        // Организации у него пока нет — её он выберет следующим шагом.
+        let memberships: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1",
+                params![uid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(memberships, 0, "аккаунт создаётся без организации");
         cleanup(conn, path);
     }
 
@@ -1792,8 +1821,11 @@ mod tests {
         cleanup(conn, path);
     }
 
+    /// Регистрация открыта всегда: аккаунт пустой, пока человек не создал
+    /// организацию или не вступил в чужую. Признак bootstrap при этом
+    /// по-прежнему показывает, что база чистая.
     #[test]
-    fn auth_options_opens_registration_only_until_bootstrap() {
+    fn registration_stays_open_while_bootstrap_flips() {
         let path = std::env::temp_dir().join(format!("meshkeeper-boot-{}.db", Uuid::new_v4()));
         let mut conn = db::open(&path).expect("test database");
 
@@ -1804,14 +1836,180 @@ mod tests {
         dispatch(
             &mut conn,
             "auth.register",
-            &json!({"fullName": "Владелец", "phone": "+79990000000", "password": "LongEnoughPass1", "workspaceName": "Объект"}),
+            &json!({"fullName": "Первый", "phone": "+79990000000", "password": "LongEnoughPass1"}),
             None,
         )
         .unwrap();
 
         let after = dispatch(&mut conn, "auth.options", &Value::Null, None).unwrap();
-        assert_eq!(after["registrationOpen"].as_bool(), Some(false));
+        assert_eq!(
+            after["registrationOpen"].as_bool(),
+            Some(true),
+            "второй человек тоже должен мочь завести аккаунт"
+        );
         assert_eq!(after["bootstrap"].as_bool(), Some(false));
+        cleanup(conn, path);
+    }
+
+    /// Один аккаунт — несколько организаций, роли в них разные. Владелец
+    /// своей группы может быть в чужой обычным работником, и права одной не
+    /// должны протекать в другую.
+    #[test]
+    fn one_account_holds_different_roles_in_different_organisations() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-multi-{}.db", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+
+        // Хозяин чужой группы, куда нашего героя позовут работником.
+        let host = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Хозяин", "phone": "+79990000001", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let foreign = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Чужая бригада"}),
+            Some(host),
+        )
+        .unwrap()["workspaceId"]
+            .as_i64()
+            .unwrap();
+        let invite = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": foreign, "role": "viewer", "maxUses": 5}),
+            Some(host),
+        )
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Наш герой: сначала своя группа, потом вступление в чужую.
+        let hero = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Герой", "phone": "+79990000002", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let own = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Своя бригада"}),
+            Some(hero),
+        )
+        .unwrap()["workspaceId"]
+            .as_i64()
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "auth.join",
+            &json!({"token": invite}),
+            Some(hero),
+        )
+        .expect("вступление в чужую группу");
+
+        // В своей — владелец, в чужой — наблюдатель.
+        assert_eq!(
+            merged_rights(&conn, hero, own)["manageUsers"].as_bool(),
+            Some(true),
+            "в своей группе он владелец"
+        );
+        assert_eq!(
+            merged_rights(&conn, hero, foreign)["manageUsers"].as_bool(),
+            Some(false),
+            "в чужой группе прав управления быть не должно"
+        );
+        assert_eq!(
+            merged_rights(&conn, hero, foreign)["createItems"].as_bool(),
+            Some(false),
+            "наблюдатель не создаёт карточки"
+        );
+
+        // Создание второй своей группы не поднимает права в чужой.
+        dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Вторая своя"}),
+            Some(hero),
+        )
+        .expect("вторая группа создаётся");
+        assert_eq!(
+            merged_rights(&conn, hero, foreign)["manageUsers"].as_bool(),
+            Some(false),
+            "права из своей группы не должны протекать в чужую"
+        );
+
+        let groups: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1",
+                params![hero],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(groups, 3, "две свои плюс одна чужая");
+        cleanup(conn, path);
+    }
+
+    /// Регистрация больше не создаёт организацию — это отдельный шаг.
+    #[test]
+    fn account_starts_without_an_organisation_and_gains_one_on_request() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-own-{}.db", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+
+        let me = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Бригадир", "phone": "+79991112233", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap();
+        let uid = me["id"].as_i64().unwrap();
+        let groups: i64 = conn
+            .query_row("SELECT COUNT(*) FROM workspaces", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(groups, 0, "регистрация не должна заводить организацию");
+
+        let created = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "ООО Ромашка"}),
+            Some(uid),
+        )
+        .expect("организация создаётся");
+        let ws = created["workspaceId"].as_i64().unwrap();
+
+        let rights: String = conn
+            .query_row(
+                "SELECT rights_json FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![uid, ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let rights: Value = serde_json::from_str(&rights).unwrap();
+        assert_eq!(
+            rights["manageUsers"].as_bool(),
+            Some(true),
+            "создатель становится владельцем своей группы"
+        );
+
+        // Справочники и статусы должны появиться сразу, иначе первая же
+        // карточка упрётся в пустые списки.
+        let statuses: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM statuses WHERE workspace_id=?1",
+                params![ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(statuses > 0, "в новой группе нет статусов");
         cleanup(conn, path);
     }
 

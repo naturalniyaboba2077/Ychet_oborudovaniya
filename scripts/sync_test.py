@@ -202,10 +202,12 @@ def main() -> int:
                 "fullName": "Дима Владелец",
                 "phone": OWNER_PHONE,
                 "password": OWNER_PASSWORD,
-                "workspaceName": "Объект Северный",
             },
         )
         check("владелец создан на сервере", isinstance(owner, dict) and "id" in owner, str(owner)[:120])
+        # Организация заводится отдельным шагом: регистрация даёт только аккаунт.
+        made = server.call("auth.createWorkspace", {"name": "Объект Северный"})
+        check("организация создана", isinstance(made, dict) and bool(made.get("workspaceId")), str(made)[:120])
         ws = server.call("meta.workspaces", None, mutation=False)
         ws_id = ws[0]["id"] if isinstance(ws, list) and ws else None
         storages = server.call("admin.storages.list", {"workspaceId": ws_id}, mutation=False)

@@ -52,10 +52,19 @@ def check(label, cond, detail=""):
 
 owner = Client("owner")
 print("== 1. Регистрация владельца ==")
-r = owner.call("auth.register", {"fullName": "Дима Владелец", "phone": "+7 900 111-22-33", "password": "SuperSecret123", "workspaceName": "Объект Северный"})
+r = owner.call("auth.register", {"fullName": "Дима Владелец", "phone": "+7 900 111-22-33", "password": "SuperSecret123"})
 show("register", r)
 check("register owner", "id" in r)
 uid_owner = r.get("id")
+
+# Регистрация заводит только аккаунт: организация — отдельный шаг, иначе
+# войти через Google было бы нельзя (он не сообщает ни телефона, ни компании).
+empty = owner.call("meta.workspaces", None, mutation=False)
+check("account starts without organisations", isinstance(empty, list) and len(empty) == 0, str(empty)[:120])
+
+created = owner.call("auth.createWorkspace", {"name": "Объект Северный"})
+show("createWorkspace", created)
+check("owner creates organisation", isinstance(created, dict) and bool(created.get("workspaceId")), str(created)[:120])
 ws = owner.call("meta.workspaces", None, mutation=False)
 show("workspaces", ws)
 ws_id = ws[0]["id"] if isinstance(ws, list) and ws else None
@@ -69,9 +78,13 @@ anon = Client("anon")
 me2 = anon.call("auth.me", None, mutation=False)
 check("anonymous has no session", me2 in (None, {}) or "__err" in me2, json.dumps(me2, ensure_ascii=False)[:120])
 
-print("\n== 3. Повторная открытая регистрация закрыта ==")
-r2 = Client("x").call("auth.register", {"fullName": "Чужой", "phone": "+7 900 999-00-11", "password": "SuperSecret123"})
-check("open registration closed after bootstrap", "__err" in r2, str(r2)[:120])
+print("\n== 3. Регистрация открыта, чужая организация не видна ==")
+stranger = Client("x")
+r2 = stranger.call("auth.register", {"fullName": "Чужой", "phone": "+7 900 999-00-11", "password": "SuperSecret123"})
+check("registration stays open", "id" in r2, str(r2)[:120])
+# Аккаунт есть, организаций нет — чужую он видеть не должен.
+seen = stranger.call("meta.workspaces", None, mutation=False)
+check("stranger sees no organisations", isinstance(seen, list) and len(seen) == 0, str(seen)[:120])
 
 print("\n== 4. Справочники и создание инструмента ==")
 dicts = owner.call("admin.dictionaries.list", {"workspaceId": ws_id, "kind": "categories"}, mutation=False)
@@ -222,7 +235,7 @@ check("SPA route /tool/1 returns 200", status("/tool/1") == 200, str(status("/to
 check("invite deep link /join returns 200", status("/join?token=abc") == 200, str(status("/join?token=abc")))
 check("missing asset still 404", status("/assets/nope.js") == 404, str(status("/assets/nope.js")))
 opts = Client("anon2").call("auth.options", None, mutation=False)
-check("registration closed after bootstrap", opts.get("registrationOpen") is False, str(opts))
+check("registration stays open for everyone", opts.get("registrationOpen") is True, str(opts))
 check("bootstrap flag is false", opts.get("bootstrap") is False, str(opts))
 
 print("\n== 19. Неисправность переводит в «На проверке» ==")
