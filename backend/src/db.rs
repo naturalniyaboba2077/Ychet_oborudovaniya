@@ -98,6 +98,28 @@ fn migrate(conn: &Connection) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL",
         [],
     );
+    // Индексы под запросы, которые выполняются на каждом экране. Без них
+    // SQLite сканирует таблицу целиком: на списке истории это сотни полных
+    // сканов подряд. Создаются отдельно от схемы, чтобы доехали и на базы,
+    // заведённые раньше.
+    for sql in [
+        "CREATE INDEX IF NOT EXISTS items_ws_idx ON items(workspace_id)",
+        "CREATE INDEX IF NOT EXISTS items_ws_title_idx ON items(workspace_id, title)",
+        "CREATE INDEX IF NOT EXISTS items_responsible_idx ON items(responsible_user_id)",
+        "CREATE INDEX IF NOT EXISTS history_ws_item_idx ON history_entries(workspace_id, item_id, id)",
+        "CREATE INDEX IF NOT EXISTS transfers_to_status_idx ON transfers(to_user_id, status)",
+        "CREATE INDEX IF NOT EXISTS transfers_from_status_idx ON transfers(from_user_id, status)",
+        "CREATE INDEX IF NOT EXISTS transfers_item_idx ON transfers(item_id)",
+        "CREATE INDEX IF NOT EXISTS notifications_user_read_idx ON notifications(user_id, read)",
+        "CREATE INDEX IF NOT EXISTS user_workspaces_ws_idx ON user_workspaces(workspace_id)",
+        "CREATE INDEX IF NOT EXISTS user_workspaces_user_idx ON user_workspaces(user_id)",
+        "CREATE INDEX IF NOT EXISTS item_photos_item_idx ON item_photos(item_id)",
+        "CREATE INDEX IF NOT EXISTS faults_item_status_idx ON faults(item_id, status)",
+        "CREATE INDEX IF NOT EXISTS holdings_item_idx ON item_holdings(item_id, returned_at)",
+    ] {
+        let _ = conn.execute(sql, []);
+    }
+
     conn.execute_batch(
         r#"
         CREATE TABLE IF NOT EXISTS google_pending (

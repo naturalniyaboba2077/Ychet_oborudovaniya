@@ -277,6 +277,18 @@ fn merged_rights(conn: &Connection, uid: i64, ws: i64) -> Value {
     rights
 }
 
+/// Есть ли у человека право в этой конкретной организации.
+///
+/// Глобальное `user_can` здесь не годится: в одном аккаунте можно быть
+/// владельцем своей группы и рядовым участником чужой, а общее поле прав
+/// хранит одно значение на всех.
+pub(crate) fn can_in_workspace(conn: &Connection, uid: i64, ws: i64, key: &str) -> bool {
+    merged_rights(conn, uid, ws)
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn require_can_in_workspace(
     conn: &Connection,
     uid: i64,
@@ -729,14 +741,21 @@ fn dispatch_inner(
         "sync.conflicts" => Ok(crate::sync::list_conflicts(conn)),
         "sync.resolveConflict" => {
             let uid = require_user(conn, user_id)?;
-            require_can(conn, uid, "editItems")?;
-            crate::sync::resolve_conflict(
-                conn,
-                i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?,
-                i64v(input, "responsibleUserId"),
-                uid,
-            )
-            .map_err(|e| ApiError::bad(e.to_string()))
+            let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+            // Конфликт живёт в конкретной группе — там и спрашиваем права.
+            // С глобальной проверкой владелец своей организации правил бы
+            // предмет в чужой, где он рядовой участник.
+            let ws: i64 = conn
+                .query_row(
+                    "SELECT workspace_id FROM conflicts WHERE id=?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .map_err(|_| ApiError::not_found("Конфликт не найден"))?;
+            require_member(conn, uid, ws)?;
+            require_can_in_workspace(conn, uid, ws, "editItems")?;
+            crate::sync::resolve_conflict(conn, id, i64v(input, "responsibleUserId"), uid)
+                .map_err(|e| ApiError::bad(e.to_string()))
         }
         "sync.pullNow" => {
             if std::env::var("MESHKEEPER_UPSTREAM")
@@ -1848,6 +1867,72 @@ mod tests {
             "второй человек тоже должен мочь завести аккаунт"
         );
         assert_eq!(after["bootstrap"].as_bool(), Some(false));
+        cleanup(conn, path);
+    }
+
+    /// Резервная копия не должна выносить чужие данные. Раньше выгружалась
+    /// вся база, а право проверялось глобально: владелец своей группы
+    /// скачивал телефоны и хеши паролей людей из чужой.
+    #[test]
+    fn backup_export_carries_only_the_callers_organisation() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-bkp-{}.db", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+
+        let host = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Хозяин", "phone": "+79990000001", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Чужая бригада"}),
+            Some(host),
+        )
+        .unwrap();
+
+        let outsider = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Посторонний", "phone": "+79990000002", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Своя бригада"}),
+            Some(outsider),
+        )
+        .unwrap();
+
+        let blob = dispatch(
+            &mut conn,
+            "backup.export",
+            &json!({"password": "LongEnoughPass1"}),
+            Some(outsider),
+        )
+        .expect("свою копию снять можно");
+        let plain = crate::sync::decrypt_backup("LongEnoughPass1", &blob).expect("расшифровка");
+
+        assert!(
+            !plain.contains("Хозяин"),
+            "в копию попал человек из чужой организации"
+        );
+        assert!(
+            !plain.contains("Чужая бригада"),
+            "в копию попала чужая организация"
+        );
+        assert!(
+            plain.contains("Своя бригада"),
+            "своя организация должна быть"
+        );
         cleanup(conn, path);
     }
 

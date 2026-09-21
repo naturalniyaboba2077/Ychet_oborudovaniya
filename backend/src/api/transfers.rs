@@ -35,7 +35,7 @@ pub(crate) fn transfer_by_id(conn: &Connection, input: &Value, user_id: Option<i
     require_member(conn, uid, ws)?;
     let party =
         transfer["fromUserId"].as_i64() == Some(uid) || transfer["toUserId"].as_i64() == Some(uid);
-    if !party && !user_can(conn, uid, "manageUsers") {
+    if !party && !can_in_workspace(conn, uid, ws, "manageUsers") {
         return Err(ApiError::new(
             "FORBIDDEN",
             403,
@@ -642,7 +642,9 @@ pub(crate) fn transfers_accept_atomic(
         |row| row.get(0),
     )?;
     if needs_admin {
-        require_can(conn, uid, "manageUsers")?;
+        // Заявку утверждает администратор ИМЕННО этой группы: владелец
+        // соседней организации здесь никто.
+        require_can_in_workspace(conn, uid, ws, "manageUsers")?;
     } else if t["toUserId"].as_i64() != Some(uid) {
         return Err(ApiError::new(
             "FORBIDDEN",

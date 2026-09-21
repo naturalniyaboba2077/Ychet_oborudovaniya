@@ -72,13 +72,48 @@ pub fn hello(conn: &Connection) -> Value {
     })
 }
 
+/// Условие «только эта организация» для запросов выгрузки.
+fn ws_clause(column: &str, only: Option<i64>) -> String {
+    match only {
+        Some(id) => format!(" WHERE {column}={id}"),
+        None => String::new(),
+    }
+}
+
+/// Люди, состоящие в выгружаемой организации. Чужие в копию не попадают:
+/// вместе с ними уехали бы телефоны и хеши паролей.
+fn user_clause(only: Option<i64>) -> String {
+    match only {
+        Some(id) => {
+            format!(" WHERE id IN (SELECT user_id FROM user_workspaces WHERE workspace_id={id})")
+        }
+        None => String::new(),
+    }
+}
+
+/// Полная выгрузка — для обмена между узлами, где нужна вся база.
 pub fn export_journal(conn: &Connection) -> Value {
+    export_journal_scoped(conn, None)
+}
+
+/// Выгрузка одной организации.
+///
+/// Нужна для резервных копий, которые снимает человек: раньше там вызывалась
+/// полная выгрузка, и владелец своей группы получал зашифрованный своим же
+/// паролем дамп чужих предметов, телефонов и хешей паролей. Обмен между
+/// узлами по-прежнему берёт всё — там это и есть задача.
+pub fn export_journal_for(conn: &Connection, workspace_id: i64) -> Value {
+    export_journal_scoped(conn, Some(workspace_id))
+}
+
+fn export_journal_scoped(conn: &Connection, only: Option<i64>) -> Value {
     let (node_id, name) = ensure_node(conn);
     let _ = db::fill_guids(conn);
     let mut workspaces = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT id, name, timezone, internal_id_prefix, comment, guid FROM workspaces")
-    {
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT id, name, timezone, internal_id_prefix, comment, guid FROM workspaces{}",
+        ws_clause("id", only)
+    )) {
         for row in stmt
             .query_map([], |r| {
                 Ok(json!({
@@ -98,7 +133,7 @@ pub fn export_journal(conn: &Connection) -> Value {
         }
     }
     let mut users = Vec::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT id, full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash FROM users") {
+    if let Ok(mut stmt) = conn.prepare(&format!("SELECT id, full_name, position, phone, status, role_rights, checkout_policy, guid, password_hash FROM users{}", user_clause(only))) {
         for row in stmt.query_map([], |r| {
             Ok(json!({
                 "id": r.get::<_, i64>(0)?,
@@ -117,7 +152,7 @@ pub fn export_journal(conn: &Connection) -> Value {
     }
     let mut items = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment FROM items",
+        &format!("SELECT id, internal_id, title, category_id, status_id, responsible_user_id, workspace_id, serial_number, qr_code, due_at, guid, calibrated_until, min_quantity, quantitative, quantity, unit, cost, comment FROM items{}", ws_clause("workspace_id", only)),
     ) {
         for row in stmt.query_map([], |r| {
             let id: i64 = r.get(0)?;
@@ -152,7 +187,7 @@ pub fn export_journal(conn: &Connection) -> Value {
     }
     let mut history = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid FROM history_entries ORDER BY id",
+        &format!("SELECT id, workspace_id, item_id, type, actor_user_id, from_label, to_label, quantity_delta, comment, hash, created_at, guid FROM history_entries{} ORDER BY id", ws_clause("workspace_id", only)),
     ) {
         for row in stmt.query_map([], |r| {
             let ws: i64 = r.get(1)?;
@@ -177,7 +212,7 @@ pub fn export_journal(conn: &Connection) -> Value {
     }
     let mut invites = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT token, workspace_id, role, max_uses, used_count, revoked, created_at FROM invites",
+        &format!("SELECT token, workspace_id, role, max_uses, used_count, revoked, created_at FROM invites{}", ws_clause("workspace_id", only)),
     ) {
         for row in stmt
             .query_map([], |r| {
@@ -200,9 +235,10 @@ pub fn export_journal(conn: &Connection) -> Value {
         }
     }
     let mut memberships = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT user_id, workspace_id, rights_json FROM user_workspaces")
-    {
+    if let Ok(mut stmt) = conn.prepare(&format!(
+        "SELECT user_id, workspace_id, rights_json FROM user_workspaces{}",
+        ws_clause("workspace_id", only)
+    )) {
         for row in stmt
             .query_map([], |r| {
                 Ok(json!({

@@ -123,7 +123,12 @@ pub(crate) fn notify_admins(conn: &Connection, ws: i64, item_id: i64, title: &st
         .map(|r| r.filter_map(|x| x.ok()).collect())
         .unwrap_or_default();
     for uid in ids {
-        if user_can(conn, uid, "manageUsers") || user_can(conn, uid, "editItems") {
+        // Администратор — тот, кто администратор ИМЕННО здесь. С глобальной
+        // проверкой заявку видел бы владелец соседней организации, а local
+        // администратор без общих прав — нет.
+        if can_in_workspace(conn, uid, ws, "manageUsers")
+            || can_in_workspace(conn, uid, ws, "editItems")
+        {
             let _ = conn.execute(
                 "INSERT INTO notifications (user_id, item_id, type, title, text, created_at) VALUES (?1,?2,'system',?3,?4,?5)",
                 params![uid, item_id, title, text, now()],

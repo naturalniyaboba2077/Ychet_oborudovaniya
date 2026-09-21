@@ -92,8 +92,8 @@ pub(crate) fn inv_results(conn: &Connection, input: &Value, user_id: Option<i64>
 
 pub(crate) fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "inventory")?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_can_in_workspace(conn, uid, ws, "inventory")?;
     let n: i64 = conn.query_row(
         "SELECT COUNT(*) FROM inventory_sessions WHERE workspace_id=?1",
         params![ws],
@@ -121,7 +121,6 @@ pub(crate) fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>)
 
 pub(crate) fn inv_check(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "inventory")?;
     let sid = i64v(input, "sessionId").ok_or_else(|| ApiError::bad("sessionId"))?;
     let iid = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let (ws, status): (i64, String) = conn.query_row(
@@ -130,6 +129,7 @@ pub(crate) fn inv_check(conn: &Connection, input: &Value, user_id: Option<i64>) 
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "inventory")?;
     if status != "in_progress" {
         return Err(ApiError::conflict("Инвентаризация уже завершена"));
     }
@@ -222,7 +222,6 @@ pub(crate) fn inv_complete_atomic(
     user_id: Option<i64>,
 ) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "inventory")?;
     let sid = i64v(input, "sessionId").ok_or_else(|| ApiError::bad("sessionId"))?;
     let ws: i64 = conn.query_row(
         "SELECT workspace_id FROM inventory_sessions WHERE id=?1",
@@ -230,6 +229,7 @@ pub(crate) fn inv_complete_atomic(
         |r| r.get(0),
     )?;
     require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "inventory")?;
     let number: String = conn.query_row(
         "SELECT number FROM inventory_sessions WHERE id=?1",
         params![sid],

@@ -3,11 +3,12 @@
 #
 # ТЗ §6 требует обязательную резервную копию. В серверной схеме её делает сам
 # сервер: копия снимается штатным механизмом SQLite (без остановки сервиса),
-# затем сжимается и шифруется, старые копии удаляются по сроку хранения.
+# проверяется на читаемость, затем сжимается и шифруется, старые копии
+# удаляются по сроку хранения.
 #
 # Запускается таймером systemd, см. meshkeeper-backup.timer.
 #
-# Переменные (из /etc/meshkeeper/meshkeeper.env):
+# Переменные (из файла окружения сервиса):
 #   MESHKEEPER_DB             путь к базе
 #   MESHKEEPER_BACKUP_DIR     куда складывать (по умолчанию /var/backups/meshkeeper)
 #   MESHKEEPER_BACKUP_KEEP    сколько копий хранить (по умолчанию 14)
@@ -25,19 +26,38 @@ if [ ! -f "$DB" ]; then
   exit 1
 fi
 
+# sqlite3 обязателен, и это не придирка. База работает в режиме WAL: сам файл
+# .db содержит почти пустой заголовок, а все данные лежат в -wal до
+# контрольной точки. Копирование файла через cp давало зашифрованный архив на
+# 128 байт — формально успех, фактически пустота, и обнаруживается это в тот
+# день, когда копия понадобилась. Лучше громко упасть.
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "нет sqlite3 — копию снять нечем. Установите: apt install sqlite3" >&2
+  exit 1
+fi
+
 mkdir -p "$DEST"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-# .backup корректно работает на живой базе в режиме WAL, в отличие от cp.
-if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 "$DB" ".backup '$TMP/meshkeeper.db'"
-else
-  echo "нет sqlite3, копирую файлы базы целиком" >&2
-  cp "$DB" "$TMP/meshkeeper.db"
-  [ -f "$DB-wal" ] && cp "$DB-wal" "$TMP/meshkeeper.db-wal"
-  [ -f "$DB-shm" ] && cp "$DB-shm" "$TMP/meshkeeper.db-shm"
+# .backup читает базу целиком вместе с WAL и делает это на живой базе,
+# не мешая сервису.
+sqlite3 "$DB" ".backup '$TMP/meshkeeper.db'"
+
+# Проверяем то, что сняли, а не то, что собирались снять. Пустой или битый
+# файл дальше не пойдёт.
+INTEGRITY="$(sqlite3 "$TMP/meshkeeper.db" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+if [ "$INTEGRITY" != "ok" ]; then
+  echo "копия не прошла проверку целостности: $INTEGRITY" >&2
+  exit 1
 fi
+
+TABLES="$(sqlite3 "$TMP/meshkeeper.db" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';")"
+if [ "$TABLES" -lt 1 ]; then
+  echo "в копии нет ни одной таблицы — снимать нечего" >&2
+  exit 1
+fi
+USERS="$(sqlite3 "$TMP/meshkeeper.db" 'SELECT COUNT(*) FROM users;' 2>/dev/null || echo 0)"
 
 gzip -9 "$TMP/meshkeeper.db"
 OUT="$DEST/meshkeeper-$STAMP.db.gz"
@@ -49,13 +69,28 @@ if [ -n "${MESHKEEPER_BACKUP_PASS:-}" ] && command -v openssl >/dev/null 2>&1; t
     -in "$TMP/meshkeeper.db.gz" -out "$OUT.enc" \
     -pass env:MESHKEEPER_BACKUP_PASS
   OUT="$OUT.enc"
+
+  # Восстановление проверяем на самом деле, а не надеемся на него: архив
+  # расшифровывается обратно и открывается как база. Иначе следующая тихая
+  # поломка найдётся так же поздно, как эта.
+  openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+    -in "$OUT" -out "$TMP/check.db.gz" -pass env:MESHKEEPER_BACKUP_PASS
+  gunzip -f "$TMP/check.db.gz"
+  BACK="$(sqlite3 "$TMP/check.db" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+  if [ "$BACK" != "ok" ]; then
+    echo "копия не восстанавливается: $BACK" >&2
+    rm -f "$OUT"
+    exit 1
+  fi
+  rm -f "$TMP/check.db"
 else
   cp "$TMP/meshkeeper.db.gz" "$OUT"
   echo "ВНИМАНИЕ: MESHKEEPER_BACKUP_PASS не задан, копия не зашифрована" >&2
 fi
 
 chmod 600 "$OUT"
-echo "копия готова: $OUT ($(du -h "$OUT" | cut -f1))"
+SIZE="$(du -h "$OUT" | cut -f1)"
+echo "копия готова: $OUT ($SIZE, таблиц $TABLES, пользователей $USERS, восстановление проверено)"
 
 # Ротация по количеству копий.
 mapfile -t OLD < <(ls -1t "$DEST"/meshkeeper-*.db.gz* 2>/dev/null | tail -n +"$((KEEP + 1))")

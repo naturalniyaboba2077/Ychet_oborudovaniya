@@ -252,9 +252,11 @@ pub(crate) fn items_update_atomic(
     user_id: Option<i64>,
 ) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "editItems")?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    require_item_access(conn, uid, id)?;
+    let item_ws = require_item_access(conn, uid, id)?;
+    // Право спрашиваем в группе предмета, а не глобально: в одном
+    // аккаунте роли в разных организациях разные.
+    require_can_in_workspace(conn, uid, item_ws, "editItems")?;
     let before = jsn::item_json(conn, id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     let ws = before["workspaceId"]
@@ -364,10 +366,11 @@ pub(crate) fn items_update_atomic(
 
 pub(crate) fn items_remove(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "deleteItems")?;
-    let _ = uid;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
-    require_item_access(conn, uid, id)?;
+    let ws = require_item_access(conn, uid, id)?;
+    // Право спрашиваем в группе предмета, а не глобально: в одном
+    // аккаунте роли в разных организациях разные.
+    require_can_in_workspace(conn, uid, ws, "deleteItems")?;
     conn.execute("DELETE FROM item_photos WHERE item_id=?1", params![id])?;
     conn.execute("DELETE FROM items WHERE id=?1", params![id])?;
     Ok(json!({"ok": true}))
@@ -400,9 +403,11 @@ pub(crate) fn insert_photo(
 
 pub(crate) fn items_add_photo(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "editItems")?;
     let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
-    require_item_access(conn, uid, item_id)?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    // Право спрашиваем в группе предмета, а не глобально: в одном
+    // аккаунте роли в разных организациях разные.
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
     let url = s(input, "url").ok_or_else(|| ApiError::bad("url"))?;
     let is_title = b(input, "isTitle").unwrap_or(false);
     let thumb = s(input, "thumbUrl");

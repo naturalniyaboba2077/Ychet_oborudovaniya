@@ -103,12 +103,14 @@ pub(crate) fn history_write_off_atomic(
     user_id: Option<i64>,
 ) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "writeOff")?;
     if s(input, "comment").is_none() {
         return Err(ApiError::bad("Укажите причину списания"));
     }
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let item_ws = require_item_access(conn, uid, id)?;
+    // Право спрашиваем в группе предмета, а не глобально: в одном
+    // аккаунте роли в разных организациях разные.
+    require_can_in_workspace(conn, uid, item_ws, "writeOff")?;
     // ТЗ §8: если группа так настроена, списание без фото не принимается.
     let photo = s(input, "photoUrl");
     if requires_writeoff_photo(conn, item_ws) && photo.is_none() {
@@ -190,13 +192,15 @@ pub(crate) fn history_replenish_atomic(
     user_id: Option<i64>,
 ) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "replenish")?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
     let qty = f64v(input, "quantity").ok_or_else(|| ApiError::bad("quantity"))?;
     if qty <= 0.0 {
         return Err(ApiError::bad("Количество должно быть больше нуля"));
     }
-    require_item_access(conn, uid, id)?;
+    let ws = require_item_access(conn, uid, id)?;
+    // Право спрашиваем в группе предмета, а не глобально: в одном
+    // аккаунте роли в разных организациях разные.
+    require_can_in_workspace(conn, uid, ws, "replenish")?;
     let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
     if !item["quantitative"].as_bool().unwrap_or(false) {
         return Err(ApiError::bad("Инструмент не количественный"));
@@ -234,9 +238,11 @@ pub(crate) fn history_move_atomic(
     user_id: Option<i64>,
 ) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "editItems")?;
     let id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
-    require_item_access(conn, uid, id)?;
+    let ws = require_item_access(conn, uid, id)?;
+    // Право спрашиваем в группе предмета, а не глобально: в одном
+    // аккаунте роли в разных организациях разные.
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
     conn.execute(
         "UPDATE items SET storage_id=COALESCE(?1,storage_id), building_site_id=?2 WHERE id=?3",
         params![

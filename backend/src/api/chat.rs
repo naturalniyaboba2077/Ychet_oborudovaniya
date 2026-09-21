@@ -42,18 +42,36 @@ pub(crate) fn chat_send(conn: &Connection, input: &Value, user_id: Option<i64>) 
     }))
 }
 
+/// Резервная копия одной организации.
+///
+/// Раньше здесь вызывалась полная выгрузка, а право проверялось глобально:
+/// владелец своей группы скачивал зашифрованный своим паролем дамп чужих
+/// предметов, людей, телефонов и хешей паролей. Теперь организация
+/// указывается явно, и право проверяется именно в ней.
 pub(crate) fn backup_export(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "manageWorkspaces")?;
+    let ws = i64v(input, "workspaceId")
+        .or_else(|| own_workspace(conn, uid))
+        .ok_or_else(|| ApiError::bad("Укажите организацию"))?;
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
     let password = s(input, "password").ok_or_else(|| ApiError::bad("Пароль архива обязателен"))?;
-    let journal = crate::sync::export_journal(conn);
+    let journal = crate::sync::export_journal_for(conn, ws);
     crate::sync::encrypt_backup(&password, &journal.to_string())
         .map_err(|e| ApiError::bad(e.to_string()))
 }
 
+/// Восстановление из копии.
+///
+/// Право проверяется в конкретной организации: с глобальной проверкой любой
+/// владелец своей группы мог дописать людей и членства в чужую.
 pub(crate) fn backup_import(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let uid = require_user(conn, user_id)?;
-    require_can(conn, uid, "manageWorkspaces")?;
+    let ws = i64v(input, "workspaceId")
+        .or_else(|| own_workspace(conn, uid))
+        .ok_or_else(|| ApiError::bad("Укажите организацию"))?;
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "manageWorkspaces")?;
     let password = s(input, "password").ok_or_else(|| ApiError::bad("Пароль архива обязателен"))?;
     let blob = input
         .get("blob")

@@ -91,7 +91,12 @@ pub(crate) fn admin_user_create(conn: &Connection, input: &Value) -> ApiResult {
 
 pub(crate) fn admin_user_update(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
     if let Some(uid) = actor {
-        require_can(conn, uid, "manageUsers")?;
+        // Управлять людьми можно в той организации, где ты администратор.
+        // Глобальная проверка пускала бы владельца своей группы править
+        // карточки в чужой.
+        let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+        require_member(conn, uid, ws)?;
+        require_can_in_workspace(conn, uid, ws, "manageUsers")?;
     }
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
     conn.execute("UPDATE users SET full_name=COALESCE(?2,full_name), position=COALESCE(?3,position), phone=COALESCE(?4,phone), status=COALESCE(?5,status) WHERE id=?1",
