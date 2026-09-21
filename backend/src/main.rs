@@ -138,6 +138,18 @@ async fn trpc(
             return (StatusCode::FORBIDDEN, "cross-site request rejected").into_response();
         }
     }
+    // Адрес клиента приходит от обратного прокси. Берём первый элемент
+    // X-Forwarded-For: остальные дописывают промежуточные узлы, и доверять
+    // им нельзя. Заголовок подделывается, поэтому это заслон от перебора,
+    // а не доказательство личности.
+    let client_addr = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default();
+    api::set_client_address(&client_addr);
+
     let token = session_token(&headers).map(str::to_owned);
     let batched = calls.len() > 1 || q.get("batch").map(|s| s.as_str()) == Some("1");
     let mut conn = state.db.lock();
@@ -340,6 +352,64 @@ fn log_event(procedure: &str, uid: Option<i64>, error: Option<&api::ApiError>) {
         ),
         None => eprintln!("{} ok {procedure} {who}", chrono::Utc::now().to_rfc3339()),
     }
+}
+
+/// Предельный размер запроса. Карточка с несколькими снимками в это
+/// укладывается; заливка диска — нет.
+const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
+
+/// Отдаёт вложение по имени файла.
+///
+/// Раздаём сами, а не готовым каталогом: снимки закрыты правом «видеть
+/// фотографии», и публичная раздача обошла бы его — тот, у кого право
+/// отобрали, продолжал бы качать по сохранённой ссылке. Плюс имя проверяется
+/// по строгому шаблону, поэтому выйти за пределы каталога нечем.
+async fn serve_attachment(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    // Имя — контрольная сумма и расширение. Ни путей, ни точек, ни слэшей.
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some(v) => v,
+        None => return (StatusCode::NOT_FOUND, "нет такого файла").into_response(),
+    };
+    let sane = stem.len() == 64
+        && stem.bytes().all(|b| b.is_ascii_hexdigit())
+        && (1..=4).contains(&ext.len())
+        && ext.bytes().all(|b| b.is_ascii_alphanumeric());
+    if !sane {
+        return (StatusCode::NOT_FOUND, "нет такого файла").into_response();
+    }
+
+    {
+        let conn = state.db.lock();
+        let token = session_token(&headers);
+        if auth::resolve_session(&conn, token).is_none() {
+            return (StatusCode::UNAUTHORIZED, "нужен вход").into_response();
+        }
+    }
+
+    let path = api::files_dir().join(&name);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (StatusCode::NOT_FOUND, "нет такого файла").into_response();
+    };
+    let mime = match ext {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "pdf" => "application/pdf",
+        _ => "image/jpeg",
+    };
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", mime)
+        // Имя файла — сумма содержимого, поэтому по одному адресу всегда
+        // одно и то же. Кэш приватный: ответ зависит от сессии.
+        .header("cache-control", "private, max-age=31536000, immutable")
+        .header("x-content-type-options", "nosniff")
+        .body(axum::body::Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn health() -> impl IntoResponse {
@@ -673,11 +743,13 @@ async fn main() {
             get(sync_journal_get).post(sync_journal_post),
         )
         .route("/auth/google/callback", get(google_callback))
-        // Вложения лежат файлами на диске, а не строками в базе. Имя файла —
-        // контрольная сумма содержимого, поэтому содержимое по одному адресу
-        // не меняется и его можно кэшировать надолго.
-        .nest_service("/files", ServeDir::new(api::files_dir()))
+        .route("/files/{name}", get(serve_attachment))
         .route("/api/trpc/{*procedures}", any(trpc))
+        // Предел на размер запроса. Без него любой желающий заливает сколько
+        // угодно: тело читается в память целиком, а снимки теперь ещё и
+        // ложатся на диск. Двадцать мегабайт — с запасом на карточку с
+        // несколькими фотографиями, но не на заполнение диска.
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_BODY_BYTES))
         .fallback_service(static_files)
         .with_state(state);
     let addr = std::env::var("MESHKEEPER_BIND").unwrap_or_else(|_| "127.0.0.1:8080".into());

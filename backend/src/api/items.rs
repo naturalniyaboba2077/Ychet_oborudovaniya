@@ -417,6 +417,13 @@ pub(crate) fn photo_checksum(url: &str) -> String {
     hex::encode(Sha256::digest(url.as_bytes()))
 }
 
+/// Предельный размер одного вложения после раскодирования.
+///
+/// Клиент ужимает снимки до 1600 точек по длинной стороне — это сотни
+/// килобайт. Восемь мегабайт оставляют запас на исходники с телефона и не
+/// дают одним запросом занять диск.
+const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Куда складывать вложения. Рядом с базой, если не сказано иное.
 pub fn files_dir() -> std::path::PathBuf {
     if let Ok(dir) = std::env::var("MESHKEEPER_FILES_DIR") {
@@ -458,7 +465,9 @@ pub(crate) fn store_data_url(raw: &str) -> Option<String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload.as_bytes())
         .ok()?;
-    if bytes.is_empty() {
+    if bytes.is_empty() || bytes.len() > MAX_ATTACHMENT_BYTES {
+        // Слишком большой файл не режем молча: пусть лучше снимок не
+        // сохранится, чем кто-то заполнит диск карточками по сто мегабайт.
         return None;
     }
     let sum = {

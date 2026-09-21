@@ -398,7 +398,49 @@ pub(crate) fn seed_workspace_defaults(
 /// а потом решает, завести свою группу или вступить в чужую по приглашению.
 /// Раньше эти два действия были склеены, и войти через Google было нельзя в
 /// принципе: Google не сообщает ни телефона, ни названия организации.
+/// Сколько учётных записей разрешено завести с одного адреса за час.
+///
+/// Регистрация открыта: аккаунт без организации пустой, и это осознанное
+/// решение. Но открытая дверь без счётчика — приглашение набить базу
+/// мусором, а вместе с ней и диск, раз вложения теперь ложатся файлами.
+const SIGNUPS_PER_HOUR: i64 = 5;
+const SIGNUP_WINDOW_SECS: i64 = 3600;
+
+/// Не даёт штамповать аккаунты пачками с одного адреса.
+///
+/// Адрес берётся из заголовка, который проставляет обратный прокси. Это не
+/// защита от упорного злоумышленника — адрес меняется, — а заслон от
+/// простого перебора и случайного цикла в чужом скрипте.
+fn check_signup_allowed(conn: &Connection, from: &str) -> Result<(), ApiError> {
+    let key = format!("signup:{from}");
+    let edge = (chrono::Utc::now() - chrono::Duration::seconds(SIGNUP_WINDOW_SECS)).to_rfc3339();
+    let recent: i64 = conn
+        .query_row(
+            "SELECT failures FROM login_throttle WHERE key=?1 AND last_failure_at > ?2",
+            params![key, edge],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    if recent >= SIGNUPS_PER_HOUR {
+        return Err(ApiError::new(
+            "TOO_MANY_REQUESTS",
+            429,
+            "Слишком много регистраций с этого адреса. Попробуйте позже.",
+        ));
+    }
+    conn.execute(
+        "INSERT INTO login_throttle (key, failures, last_failure_at) VALUES (?1,1,?2)
+         ON CONFLICT(key) DO UPDATE SET
+            failures = CASE WHEN login_throttle.last_failure_at > ?3 THEN failures + 1 ELSE 1 END,
+            last_failure_at = ?2",
+        params![key, chrono::Utc::now().to_rfc3339(), edge],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn auth_register(conn: &Connection, input: &Value) -> ApiResult {
+    check_signup_allowed(conn, &client_address())?;
     let full_name = s(input, "fullName").ok_or_else(|| ApiError::bad("Введите имя"))?;
     let phone = s(input, "phone").ok_or_else(|| ApiError::bad("Введите телефон"))?;
     let password = s(input, "password").ok_or_else(|| ApiError::bad("Введите пароль"))?;

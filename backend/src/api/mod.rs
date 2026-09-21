@@ -39,6 +39,26 @@ use uuid::Uuid;
 
 thread_local! {
     static CURRENT_UID: Cell<Option<i64>> = const { Cell::new(None) };
+    /// Адрес, с которого пришёл текущий запрос. Нужен счётчику регистраций:
+    /// открытая дверь без него — приглашение набить базу мусором.
+    static CURRENT_ADDR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Запоминает адрес клиента на время обработки запроса.
+pub fn set_client_address(addr: &str) {
+    CURRENT_ADDR.with(|c| *c.borrow_mut() = addr.to_string());
+}
+
+/// Адрес клиента; «неизвестно», когда прокси его не передал.
+pub(crate) fn client_address() -> String {
+    CURRENT_ADDR.with(|c| {
+        let v = c.borrow();
+        if v.is_empty() {
+            "неизвестно".to_string()
+        } else {
+            v.clone()
+        }
+    })
 }
 
 fn ws_fallback(conn: &Connection) -> i64 {
@@ -2027,6 +2047,51 @@ mod tests {
             Some(users[2]),
         );
         assert!(denied.is_err(), "без права manageUsers сброс запрещён");
+        cleanup(conn, path);
+    }
+
+    /// Регистрация открыта, но не безгранична: иначе базу набивают мусором,
+    /// а вместе с ней и диск — вложения теперь ложатся файлами.
+    #[test]
+    fn open_registration_is_rate_limited_per_address() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-rate-{}", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+        set_client_address("203.0.113.7");
+
+        for n in 1..=5 {
+            dispatch(
+                &mut conn,
+                "auth.register",
+                &json!({
+                    "fullName": format!("Человек {n}"),
+                    "phone": format!("+7900000000{n}"),
+                    "password": "LongEnoughPass1"
+                }),
+                None,
+            )
+            .unwrap_or_else(|e| panic!("регистрация {n} должна проходить: {}", e.message));
+        }
+
+        let sixth = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Лишний", "phone": "+79000000099", "password": "LongEnoughPass1"}),
+            None,
+        );
+        let err = sixth.expect_err("шестая регистрация подряд должна отклоняться");
+        assert_eq!(err.http, 429, "ожидался отказ по частоте: {}", err.message);
+
+        // С другого адреса дверь по-прежнему открыта.
+        set_client_address("203.0.113.8");
+        dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Другой", "phone": "+79000000077", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .expect("счётчик привязан к адресу, а не ко всей системе");
+
+        set_client_address("");
         cleanup(conn, path);
     }
 
