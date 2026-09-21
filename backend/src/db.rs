@@ -11,6 +11,7 @@ pub fn open(path: &Path) -> Result<Connection> {
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     apply_encryption_key(&conn)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    register_unicode_lower(&conn)?;
     init_schema(&conn)?;
     migrate(&conn)?;
     if std::env::var("MESHKEEPER_DEMO_DATA").as_deref() == Ok("1") {
@@ -51,6 +52,26 @@ fn apply_encryption_key(_conn: &Connection) -> Result<()> {
     if std::env::var("MESHKEEPER_DB_KEY").is_ok() {
         eprintln!("MESHKEEPER_DB_KEY задан, но сборка без шифрования — база останется открытой");
     }
+    Ok(())
+}
+
+/// Приводит строку к нижнему регистру с учётом не только латиницы.
+///
+/// Встроенный в SQLite `lower()` знает только ASCII: «ВН-0007» он оставляет
+/// как есть, и поиск по внутреннему номеру кириллицей ничего не находит.
+/// Раньше отбор шёл в Rust и этой беды не было; когда он переехал в запрос,
+/// понадобилась своя функция.
+fn register_unicode_lower(conn: &Connection) -> Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    conn.create_scalar_function(
+        "mk_lower",
+        1,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let raw: String = ctx.get(0).unwrap_or_default();
+            Ok(raw.to_lowercase())
+        },
+    )?;
     Ok(())
 }
 

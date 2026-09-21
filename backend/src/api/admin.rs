@@ -124,6 +124,79 @@ pub(crate) fn admin_user_update(conn: &Connection, input: &Value, actor: Option<
 /// Исключение участника. Историю и подписанные блоки трогать нельзя (ТЗ §7—8):
 /// если за человеком что-то числится, он блокируется и выводится из пространства,
 /// а не стирается вместе со следами своих операций.
+/// Сброс пароля администратором.
+///
+/// Самостоятельного восстановления в системе нет и быть не может: ни почты,
+/// ни SMS у неё нет, а отправлять новый пароль некуда. Зато администратор
+/// видит человека живьём — он и подтверждает личность. Новый пароль
+/// показывается ровно один раз, в ответе на этот запрос.
+pub(crate) fn admin_user_reset_password(
+    conn: &Connection,
+    input: &Value,
+    actor: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, actor)?;
+    let target = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    require_member(conn, uid, ws)?;
+    require_can_in_workspace(conn, uid, ws, "manageUsers")?;
+    // Сбрасывать можно только своему: иначе администратор одной организации
+    // менял бы пароли в чужой.
+    require_shared_workspace(conn, uid, target)?;
+    if target == uid {
+        return Err(ApiError::bad(
+            "Свой пароль меняйте в профиле — там нужен текущий",
+        ));
+    }
+
+    let fresh = temporary_password();
+    let changed = conn.execute(
+        "UPDATE users SET password_hash=?1 WHERE id=?2",
+        params![hash_password(&fresh), target],
+    )?;
+    if changed != 1 {
+        return Err(ApiError::not_found("Сотрудник не найден"));
+    }
+    // Все прежние сессии этого человека закрываем: если пароль сбрасывают
+    // из-за утери доступа, чужой вход не должен пережить сброс.
+    let _ = conn.execute("DELETE FROM sessions WHERE user_id=?1", params![target]);
+
+    let who = jsn::user_public(conn, target)
+        .and_then(|u| u["fullName"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| format!("сотрудник #{target}"));
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        None,
+        "update",
+        None,
+        None,
+        None,
+        Some(&format!("Пароль сброшен администратором: {who}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+
+    Ok(json!({
+        "ok": true,
+        "password": fresh,
+        "note": "Передайте пароль лично. Он показывается один раз и больше нигде не хранится."
+    }))
+}
+
+/// Временный пароль: читаемый вслух, но не угадываемый.
+///
+/// Без похожих символов — их путают, когда диктуют или переписывают с
+/// бумажки, и человек не может войти по совершенно верному паролю.
+fn temporary_password() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"abcdefghijkmnpqrstuvwxyzACDEFGHJKLMNPQRTUVWXY2346789";
+    let mut rng = rand::thread_rng();
+    (0..14)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
 pub(crate) fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<i64>) -> ApiResult {
     let uid = require_user(conn, actor)?;
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;

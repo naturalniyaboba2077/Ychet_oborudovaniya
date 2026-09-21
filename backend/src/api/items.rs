@@ -55,49 +55,85 @@ pub(crate) fn item_for_list(conn: &Connection, id: i64) -> Option<Value> {
     Some(item)
 }
 
+/// Каталог с постраничным выводом.
+///
+/// Раньше сюда вычитывались все строки пространства, фильтровались в Rust, и
+/// только потом резалась страница: на каталоге в тысячи позиций это тысячи
+/// лишних строк на каждый экран. Теперь отбор и страница делаются запросом,
+/// а из базы приходит ровно то, что показываем.
 pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let page = i64v(input, "page").unwrap_or(1).max(1);
     let limit = i64v(input, "limit").unwrap_or(20).clamp(1, 500);
-    let search = s(input, "search").map(|q| q.to_lowercase());
+    let search = s(input, "search")
+        .map(|q| q.trim().to_lowercase())
+        .filter(|q| !q.is_empty());
     let only_mine = b(input, "onlyMine").unwrap_or(false);
-    let mut stmt = conn.prepare("SELECT id, title, internal_id, serial_number, responsible_user_id FROM items WHERE workspace_id=?1 ORDER BY created_at DESC, id DESC")?;
-    let mut ids: Vec<i64> = Vec::new();
-    let rows = stmt.query_map(params![ws], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, Option<String>>(3)?,
-            r.get::<_, Option<i64>>(4)?,
-        ))
-    })?;
-    for row in rows.flatten() {
-        let (id, title, internal, serial, resp) = row;
-        if only_mine && resp != user_id {
-            continue;
-        }
-        if let Some(ref q) = search {
-            let blob = format!(
-                "{} {} {}",
-                title,
-                internal,
-                serial.clone().unwrap_or_default()
-            )
-            .to_lowercase();
-            if !blob.contains(q) {
-                continue;
-            }
-        }
-        ids.push(id);
+
+    // Условия собираем один раз и используем и для счётчика, и для страницы,
+    // чтобы «всего» и содержимое не могли разойтись.
+    let mut where_sql = String::from("workspace_id = ?1");
+    if only_mine {
+        // user_id может отсутствовать: тогда «моих» предметов нет вовсе.
+        where_sql.push_str(match user_id {
+            Some(_) => " AND responsible_user_id = ?2",
+            None => " AND 0",
+        });
     }
-    let total = ids.len() as i64;
-    let start = ((page - 1) * limit) as usize;
-    let has_more = total > start as i64 + limit;
+    if search.is_some() {
+        // LIKE с ESCAPE: в названиях и номерах встречаются % и _ как обычные
+        // символы, и без экранирования они работали бы как шаблон.
+        where_sql.push_str(
+            r" AND (mk_lower(title) LIKE :q ESCAPE '\'
+                   OR mk_lower(internal_id) LIKE :q ESCAPE '\'
+                   OR mk_lower(COALESCE(serial_number,'')) LIKE :q ESCAPE '\')",
+        );
+    }
+
+    let pattern = search.as_ref().map(|q| {
+        let escaped = q
+            .replace('\\', r"\\")
+            .replace('%', r"\%")
+            .replace('_', r"\_");
+        format!("%{escaped}%")
+    });
+
+    // rusqlite не смешивает нумерованные и именованные параметры в одном
+    // запросе, поэтому собираем список значений по порядку.
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ws)];
+    if only_mine {
+        if let Some(uid) = user_id {
+            args.push(Box::new(uid));
+        }
+    }
+    let where_sql = match &pattern {
+        Some(_) => {
+            let idx = args.len() + 1;
+            args.push(Box::new(pattern.clone().unwrap()));
+            where_sql.replace(":q", &format!("?{idx}"))
+        }
+        None => where_sql,
+    };
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
+
+    let total: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM items WHERE {where_sql}"),
+        refs.as_slice(),
+        |r| r.get(0),
+    )?;
+
+    let offset = (page - 1) * limit;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM items WHERE {where_sql} ORDER BY created_at DESC, id DESC LIMIT {limit} OFFSET {offset}"
+    ))?;
+    let ids: Vec<i64> = stmt
+        .query_map(refs.as_slice(), |r| r.get(0))?
+        .filter_map(|x| x.ok())
+        .collect();
+
+    let has_more = total > offset + ids.len() as i64;
     let rows: Vec<Value> = ids
         .into_iter()
-        .skip(start)
-        .take(limit as usize)
         .filter_map(|id| item_for_list(conn, id))
         .collect();
     Ok(json!({"rows": rows, "page": page, "limit": limit, "hasMore": has_more, "total": total}))

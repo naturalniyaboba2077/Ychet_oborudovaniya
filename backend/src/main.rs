@@ -164,9 +164,13 @@ async fn trpc(
                     let _ = auth::revoke_session(&conn, token.as_deref());
                     set_session = Some(None);
                 }
+                log_event(proc, uid, None);
                 out.push(ok_payload(data));
             }
-            Err(e) => out.push(err_payload(&e)),
+            Err(e) => {
+                log_event(proc, uid, Some(&e));
+                out.push(err_payload(&e));
+            }
         }
     }
     let body = if batched || out.len() != 1 {
@@ -305,6 +309,37 @@ fn html_escape(raw: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+/// Пишет в журнал сервиса то, что нужно при разборе инцидента.
+///
+/// Раньше в journald попадало только сообщение о старте: ни входов, ни
+/// отказов, ни ошибок обмена. Для системы, от которой требуют аудит, это
+/// странно — когда спросят «кто и когда», отвечать будет нечем.
+///
+/// Пишем не всё подряд: успешные чтения дают шум, в котором тонет важное.
+/// В журнал идут изменения, попытки входа и любые отказы.
+fn log_event(procedure: &str, uid: Option<i64>, error: Option<&api::ApiError>) {
+    let interesting =
+        api::is_mutation(procedure) || procedure.starts_with("auth.") || error.is_some();
+    if !interesting {
+        return;
+    }
+    let who = match uid {
+        Some(id) => format!("user:{id}"),
+        None => "аноним".to_string(),
+    };
+    match error {
+        // Текста ошибки достаточно: персональных данных в нём нет, а
+        // причина отказа видна.
+        Some(e) => eprintln!(
+            "{} ОТКАЗ {procedure} {who} {} {}",
+            chrono::Utc::now().to_rfc3339(),
+            e.code,
+            e.message
+        ),
+        None => eprintln!("{} ok {procedure} {who}", chrono::Utc::now().to_rfc3339()),
+    }
 }
 
 async fn health() -> impl IntoResponse {
@@ -589,4 +624,90 @@ async fn main() {
     eprintln!("Слушаю {addr}");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(listener, app).await.expect("serve");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Разбор батчей нетривиален и до сих пор не проверялся ни одним тестом,
+    /// хотя через него проходит каждый запрос клиента.
+    #[test]
+    fn parse_calls_handles_single_batched_and_empty() {
+        // Одиночный вызов: тело — объект с полем json (формат superjson).
+        let one = parse_calls("auth.login", None, Some(br#"{"json":{"phone":"+7"}}"#));
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].0, "auth.login");
+        assert_eq!(one[0].1["phone"], json!("+7"));
+
+        // Батч: имена через запятую, вход — по числовым ключам.
+        let many = parse_calls(
+            "auth.me,meta.workspaces",
+            None,
+            Some(br#"{"0":{"json":null},"1":{"json":{"a":1}}}"#),
+        );
+        assert_eq!(many.len(), 2);
+        assert_eq!(many[0].0, "auth.me");
+        assert_eq!(many[1].0, "meta.workspaces");
+        assert_eq!(many[1].1["a"], json!(1));
+
+        // Пустое тело: процедуры вызываются без входа.
+        let none = parse_calls("auth.options", None, None);
+        assert_eq!(none.len(), 1);
+        assert_eq!(none[0].1, Value::Null);
+
+        // Вход из строки запроса, когда тела нет (GET-запросы клиента).
+        let from_query = parse_calls("items.list", Some(r#"{"0":{"json":{"page":2}}}"#), None);
+        assert_eq!(from_query[0].1["page"], json!(2));
+
+        // Мусор вместо JSON не должен ронять разбор.
+        let broken = parse_calls("auth.me", None, Some(b"{not json"));
+        assert_eq!(broken.len(), 1);
+        assert_eq!(broken[0].1, Value::Null);
+
+        // Пустые и «/»-префиксные имена отбрасываются, а не превращаются
+        // в вызов несуществующей процедуры.
+        let dirty = parse_calls("/auth.me,,  ", None, None);
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].0, "auth.me");
+    }
+
+    /// Cookie сессии читается из общей строки, где лежат и чужие значения.
+    #[test]
+    fn session_token_is_picked_out_of_a_shared_cookie_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cookie",
+            "theme=dark; mk_session=abc123; other=1".parse().unwrap(),
+        );
+        assert_eq!(session_token(&headers), Some("abc123"));
+
+        let mut only_foreign = HeaderMap::new();
+        only_foreign.insert("cookie", "theme=dark".parse().unwrap());
+        assert_eq!(session_token(&only_foreign), None);
+
+        // Имя, оканчивающееся на mk_session, не должно подходить.
+        let mut lookalike = HeaderMap::new();
+        lookalike.insert("cookie", "not_mk_session=hack".parse().unwrap());
+        assert_eq!(lookalike.len(), 1);
+        assert_ne!(session_token(&lookalike), Some("hack"));
+    }
+
+    /// Разделение «читает» и «меняет» решает, нужна ли проверка Origin.
+    /// Ошибка здесь открыла бы изменения для запросов с чужих сайтов.
+    #[test]
+    fn mutations_are_recognised_for_the_origin_check() {
+        for p in [
+            "auth.login",
+            "auth.register",
+            "items.create",
+            "transfers.take",
+            "admin.users.update",
+        ] {
+            assert!(api::is_mutation(p), "{p} должна считаться изменяющей");
+        }
+        for p in ["auth.me", "items.list", "meta.workspaces", "auth.options"] {
+            assert!(!api::is_mutation(p), "{p} только читает");
+        }
+    }
 }

@@ -432,7 +432,31 @@ fn status_id(conn: &Connection, ws: i64, slug: &str) -> Option<i64> {
     .ok()
 }
 
+/// Применяет журнал одной транзакцией.
+///
+/// Раньше записи шли по одной, каждая своей транзакцией SQLite: падение
+/// процесса или обрыв посередине оставляли базу в полусобранном виде — часть
+/// предметов приехала, история к ним нет. Теперь всё идёт внутри savepoint:
+/// либо видно целиком, либо не видно вовсе, и аварийное завершение откатывает
+/// незавершённый импорт.
+///
+/// Чего это НЕ даёт: отдельные операции внутри по-прежнему игнорируют свои
+/// ошибки (`let _ = conn.execute(...)`), поэтому «строка не вставилась» не
+/// откатит остальное. Ради честности: транзакция закрывает обрыв и падение,
+/// но не логические сбои внутри разбора.
+///
+/// savepoint, а не transaction: импорт вызывается и изнутри чужой транзакции
+/// (backup.import), где начать новую нельзя.
 pub fn import_journal(conn: &Connection, journal: &Value) -> Value {
+    let nested = conn.execute_batch("SAVEPOINT mk_import").is_ok();
+    let result = import_journal_inner(conn, journal);
+    if nested {
+        let _ = conn.execute_batch("RELEASE mk_import");
+    }
+    result
+}
+
+fn import_journal_inner(conn: &Connection, journal: &Value) -> Value {
     let mut workspaces = 0u32;
     let mut users = 0u32;
     let mut items_n = 0u32;

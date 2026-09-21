@@ -127,6 +127,22 @@ export const adminRouter = createRouter({
         return updateUser(id, data);
       }),
 
+    // Сброс забытого пароля администратором. Самостоятельного восстановления
+    // нет: ни почты, ни SMS у системы нет, отправлять новый пароль некуда.
+    // Новый пароль возвращается один раз и нигде больше не хранится.
+    resetPassword: publicQuery
+      .input(
+        z.object({
+          id: z.number().int().positive(),
+          workspaceId: z.number().int().positive().optional(),
+        }),
+      )
+      .mutation(async () => ({
+        ok: true,
+        password: "",
+        note: "",
+      })),
+
     remove: publicQuery
       .input(z.object({ id: z.number().int().positive(), workspaceId: z.number().int().positive().optional() }))
       .mutation(async ({ input }) => {

@@ -62,8 +62,23 @@ pub struct ApiError {
 }
 
 impl From<rusqlite::Error> for ApiError {
+    /// Ошибка базы — это отказ сервера, а не «клиент прислал ерунду».
+    ///
+    /// Раньше сюда уезжал сырой текст SQLite под кодом 400: человек видел
+    /// «UNIQUE constraint failed: users.phone», наружу утекали имена таблиц и
+    /// колонок, а настоящие сбои маскировались под ошибку запроса и не
+    /// попадали в мониторинг как пятисотые.
+    ///
+    /// Нарушение уникальности — единственный случай, который действительно
+    /// вызван данными клиента, поэтому для него остаётся 409 с человеческим
+    /// текстом. Подробности уходят в журнал сервиса, а не в ответ.
     fn from(e: rusqlite::Error) -> Self {
-        Self::new("BAD_REQUEST", 400, e.to_string())
+        let raw = e.to_string();
+        if raw.contains("UNIQUE constraint failed") {
+            return Self::new("CONFLICT", 409, "Такая запись уже есть");
+        }
+        eprintln!("ошибка базы: {raw}");
+        Self::new("INTERNAL_SERVER_ERROR", 500, "Внутренняя ошибка сервера")
     }
 }
 
@@ -810,6 +825,7 @@ fn dispatch_inner(
         "admin.users.create" => admin_user_create(conn, input),
         "admin.users.update" => admin_user_update(conn, input, user_id),
         "admin.users.remove" => admin_user_remove(conn, input, user_id),
+        "admin.users.resetPassword" => admin_user_reset_password(conn, input, user_id),
         "admin.users.invite" => admin_user_invite(conn, input, user_id),
         "admin.users.defaultRights" => Ok(db::default_rights()),
         "admin.workspaces.list" => workspaces_list(conn),
@@ -1867,6 +1883,153 @@ mod tests {
             "второй человек тоже должен мочь завести аккаунт"
         );
         assert_eq!(after["bootstrap"].as_bool(), Some(false));
+        cleanup(conn, path);
+    }
+
+    /// Забытый пароль сбрасывает администратор — самостоятельного
+    /// восстановления нет, отправлять новый пароль некуда.
+    #[test]
+    fn admin_resets_a_forgotten_password_and_kills_old_sessions() {
+        let (mut conn, path, users, ws) = test_db();
+        // Заводим сотруднику пароль, как это делает приглашение.
+        conn.execute(
+            "UPDATE users SET password_hash=?1 WHERE id=?2",
+            params![hash_password("ZabytyiParol1"), users[1]],
+        )
+        .unwrap();
+        let session = crate::auth::create_session(&conn, users[1]).unwrap();
+        assert_eq!(
+            crate::auth::resolve_session(&conn, Some(&session)),
+            Some(users[1])
+        );
+
+        let reset = dispatch(
+            &mut conn,
+            "admin.users.resetPassword",
+            &json!({"id": users[1], "workspaceId": ws}),
+            Some(users[0]),
+        )
+        .expect("владелец сбрасывает пароль");
+        let fresh = reset["password"].as_str().unwrap().to_string();
+        assert!(
+            fresh.chars().count() >= 12,
+            "временный пароль слишком короткий"
+        );
+
+        // Старые сессии закрыты: сброс делают, когда доступ мог утечь.
+        assert_eq!(crate::auth::resolve_session(&conn, Some(&session)), None);
+
+        // Новым паролем войти можно, старым — нет.
+        let phone: String = conn
+            .query_row(
+                "SELECT phone FROM users WHERE id=?1",
+                params![users[1]],
+                |r| r.get(0),
+            )
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "auth.login",
+            &json!({"phone": phone, "password": fresh}),
+            None,
+        )
+        .expect("вход новым паролем");
+        let old = dispatch(
+            &mut conn,
+            "auth.login",
+            &json!({"phone": phone, "password": "ZabytyiParol1"}),
+            None,
+        );
+        assert!(old.is_err(), "старый пароль должен перестать работать");
+
+        // Рядовой участник чужие пароли не сбрасывает.
+        let denied = dispatch(
+            &mut conn,
+            "admin.users.resetPassword",
+            &json!({"id": users[0], "workspaceId": ws}),
+            Some(users[2]),
+        );
+        assert!(denied.is_err(), "без права manageUsers сброс запрещён");
+        cleanup(conn, path);
+    }
+
+    /// Каталог отдаётся страницами, а отбор делает база. Раньше всё
+    /// вычитывалось в память и резалось в Rust — на большом каталоге это
+    /// тысячи лишних строк на каждый экран.
+    #[test]
+    fn catalog_paging_and_search_happen_in_the_database() {
+        let (mut conn, path, users, ws) = test_db();
+        for n in 1..=25 {
+            conn.execute(
+                "INSERT INTO items (title, internal_id, workspace_id, created_at) VALUES (?1,?2,?3,?4)",
+                params![format!("Перфоратор {n}"), format!("ВН-{n:04}"), ws, now()],
+            )
+            .unwrap();
+        }
+        // Спецсимволы LIKE в названии не должны работать как шаблон.
+        conn.execute(
+            "INSERT INTO items (title, internal_id, workspace_id, created_at) VALUES ('Скидка 50% лом','ВН-9999',?1,?2)",
+            params![ws, now()],
+        )
+        .unwrap();
+
+        let first = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "page": 1, "limit": 10}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(first["total"].as_i64(), Some(26));
+        assert_eq!(first["rows"].as_array().unwrap().len(), 10);
+        assert_eq!(first["hasMore"].as_bool(), Some(true));
+
+        let last = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "page": 3, "limit": 10}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(last["rows"].as_array().unwrap().len(), 6);
+        assert_eq!(last["hasMore"].as_bool(), Some(false));
+
+        let found = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "search": "вн-0007"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(
+            found["total"].as_i64(),
+            Some(1),
+            "поиск по внутреннему номеру"
+        );
+
+        // «%» ищется как символ, а не как «что угодно».
+        let percent = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "search": "50%"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(
+            percent["total"].as_i64(),
+            Some(1),
+            "спецсимвол LIKE экранируется"
+        );
+
+        // Чужих предметов в «моих» быть не должно.
+        let mine = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "onlyMine": true}),
+            Some(users[1]),
+        )
+        .unwrap();
+        assert_eq!(mine["total"].as_i64(), Some(0));
         cleanup(conn, path);
     }
 

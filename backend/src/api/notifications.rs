@@ -4,6 +4,35 @@
 //! проверка прав и диспетчер.
 
 use super::*;
+use std::cell::Cell;
+
+/// Как часто пересчитывать просрочки и остатки. Раз в минуту: срок возврата
+/// меряется часами, а не секундами, и человеку незачем ждать три полных
+/// скана каталога ради списка уведомлений.
+const OVERDUE_SCAN_INTERVAL_SECS: i64 = 60;
+
+thread_local! {
+    /// Когда сканировали в последний раз, в секундах эпохи.
+    static LAST_OVERDUE_SCAN: Cell<i64> = const { Cell::new(0) };
+}
+
+/// Обёртка над пересчётом: раньше он запускался на каждый опрос списка
+/// уведомлений. Клиент опрашивает часто, пересчёт — три полных скана items
+/// под общим замком базы, и на этом вставали все остальные запросы.
+pub(crate) fn emit_overdue_and_stock_throttled(conn: &Connection) {
+    let now_s = chrono::Utc::now().timestamp();
+    let due = LAST_OVERDUE_SCAN.with(|c| {
+        if now_s - c.get() < OVERDUE_SCAN_INTERVAL_SECS {
+            false
+        } else {
+            c.set(now_s);
+            true
+        }
+    });
+    if due {
+        emit_overdue_and_stock(conn);
+    }
+}
 
 pub(crate) fn emit_overdue_and_stock(conn: &Connection) {
     let nows = now();
@@ -62,7 +91,7 @@ pub(crate) fn emit_overdue_and_stock(conn: &Connection) {
 }
 
 pub(crate) fn notif_list(conn: &Connection, user_id: Option<i64>) -> ApiResult {
-    emit_overdue_and_stock(conn);
+    emit_overdue_and_stock_throttled(conn);
     let uid = require_user(conn, user_id)?;
     let mut stmt = conn.prepare("SELECT id, user_id, item_id, type, title, text, read, created_at FROM notifications WHERE user_id=?1 ORDER BY id DESC LIMIT 100")?;
     let rows: Vec<Value> = stmt
