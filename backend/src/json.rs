@@ -176,7 +176,7 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
         .as_object()
         .cloned()?;
 
-    attach_stock_and_holders(conn, id, &mut base);
+    attach_stock_and_holders(conn, id, &mut base, with_history);
     if with_history {
         base.insert("history".into(), Value::Array(item_history(conn, id)));
         base.insert("documents".into(), Value::Array(item_docs(conn, id)));
@@ -185,7 +185,17 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
     Some(Value::Object(base))
 }
 
-fn attach_stock_and_holders(conn: &Connection, id: i64, base: &mut Map<String, Value>) {
+/// Считает остатки, держателей и «семью» — однофамильцев одной позиции.
+///
+/// `detailed` включает список самих однофамильцев: он нужен только карточке
+/// предмета. В списках он не отображается, а собирать его — запрос статуса
+/// на каждого, помноженный на число строк экрана.
+fn attach_stock_and_holders(
+    conn: &Connection,
+    id: i64,
+    base: &mut Map<String, Value>,
+    detailed: bool,
+) {
     let quantitative = base
         .get("quantitative")
         .and_then(|v| v.as_bool())
@@ -245,28 +255,69 @@ fn attach_stock_and_holders(conn: &Connection, id: i64, base: &mut Map<String, V
     let mut family_issued = 0i64;
     let mut members = Vec::new();
     if let (Some(ws), Some(title)) = (ws, title) {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT id, internal_id, responsible_user_id, status_id FROM items WHERE workspace_id=?1 AND title=?2 ORDER BY id",
-        ) {
+        // Однофамильцы и их держатели — одним запросом с соединением.
+        // Раньше здесь был скан плюс два запроса на каждого найденного
+        // (пользователь и статус), и всё это повторялось для КАЖДОЙ строки
+        // списка: на экране истории выходили сотни запросов.
+        let sql = "SELECT i.id, i.internal_id, i.responsible_user_id, i.status_id,
+                          u.full_name, u.position, u.phone, u.avatar_url,
+                          u.status, u.role_rights, u.created_at, u.checkout_policy, u.guid
+                   FROM items i LEFT JOIN users u ON u.id = i.responsible_user_id
+                   WHERE i.workspace_id=?1 AND i.title=?2 ORDER BY i.id";
+        if let Ok(mut stmt) = conn.prepare(sql) {
             if let Ok(rows) = stmt.query_map(params![ws, title], |r| {
+                let resp: Option<i64> = r.get(2)?;
+                // Карточку держателя собираем прямо из соединённых колонок —
+                // ровно та же форма, что отдаёт user_public, но без запроса.
+                let user = match resp {
+                    Some(uid) => {
+                        let policy = r
+                            .get::<_, Option<String>>(11)?
+                            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                            .unwrap_or_else(crate::db::default_checkout_policy);
+                        json!({
+                            "id": uid,
+                            "fullName": r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                            "position": r.get::<_, Option<String>>(5)?,
+                            "phone": r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                            "avatarUrl": r.get::<_, Option<String>>(7)?,
+                            "status": r.get::<_, Option<String>>(8)?.unwrap_or_else(|| "active".into()),
+                            "roleRights": rights_value(r.get::<_, Option<String>>(9)?),
+                            "createdAt": r.get::<_, Option<String>>(10)?.unwrap_or_default(),
+                            "checkoutPolicy": policy,
+                            "guid": r.get::<_, Option<String>>(12)?,
+                        })
+                    }
+                    None => Value::Null,
+                };
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, String>(1)?,
-                    r.get::<_, Option<i64>>(2)?,
+                    resp,
                     r.get::<_, Option<i64>>(3)?,
+                    user,
                 ))
             }) {
-                for (sid, vn, resp, st) in rows.flatten() {
+                for (sid, vn, resp, st, user) in rows.flatten() {
                     family_total += 1;
-                    if resp.is_some() { family_issued += 1; } else { family_stock += 1; }
-                    members.push(json!({
-                        "id": sid,
-                        "internalId": vn,
-                        "responsibleUserId": resp,
-                        "responsible": resp.and_then(|u| user_public(conn, u)),
-                        "inStock": resp.is_none(),
-                        "status": status_obj(conn, st),
-                    }));
+                    if resp.is_some() {
+                        family_issued += 1;
+                    } else {
+                        family_stock += 1;
+                    }
+                    // Список однофамильцев нужен только карточке предмета.
+                    // В списках он не показывается, а статус каждого стоит
+                    // отдельного запроса — не платим за то, чего не видно.
+                    if detailed {
+                        members.push(json!({
+                            "id": sid,
+                            "internalId": vn,
+                            "responsibleUserId": resp,
+                            "responsible": user.clone(),
+                            "inStock": resp.is_none(),
+                            "status": status_obj(conn, st),
+                        }));
+                    }
                     if sid != id {
                         if let Some(uid) = resp {
                             holders.push(json!({
@@ -274,7 +325,7 @@ fn attach_stock_and_holders(conn: &Connection, id: i64, base: &mut Map<String, V
                                 "userId": uid,
                                 "quantity": 1,
                                 "internalId": vn,
-                                "user": user_public(conn, uid).unwrap_or(Value::Null),
+                                "user": user,
                             }));
                         }
                     }

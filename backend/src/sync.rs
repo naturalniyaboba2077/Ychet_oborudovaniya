@@ -68,8 +68,32 @@ pub fn hello(conn: &Connection) -> Value {
         "nodeId": id,
         "name": name,
         "protocol": "meshkeeper-sync/2",
-        "ledger": "audit-log"
+        "ledger": "audit-log",
+        "stateTag": state_tag(conn),
     })
+}
+
+/// Короткая примета состояния базы.
+///
+/// Обмен гоняет полный снимок в обе стороны каждые несколько секунд. Честного
+/// инкрементального курсора здесь не сделать: у предметов, людей и членств нет
+/// отметки времени изменения, и «досылать начиная с X» было бы угадыванием с
+/// риском потерять правку. Зато можно не гонять снимок, когда меняться нечему:
+/// примета дёшева и меняется от любой записи.
+///
+/// Это не защита от подмены, а способ пропустить лишний обмен, поэтому
+/// достаточно счётчиков и последнего идентификатора журнала.
+pub fn state_tag(conn: &Connection) -> String {
+    let one = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        one("SELECT COALESCE(MAX(id),0) FROM history_entries"),
+        one("SELECT COUNT(*) FROM history_entries"),
+        one("SELECT COUNT(*) FROM items"),
+        one("SELECT COUNT(*) FROM users"),
+        one("SELECT COUNT(*) FROM workspaces"),
+        one("SELECT COUNT(*) FROM user_workspaces"),
+    )
 }
 
 /// Условие «только эта организация» для запросов выгрузки.

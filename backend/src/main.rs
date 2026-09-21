@@ -483,6 +483,46 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         sync::add_peer(&db, upstream, Some("Сервер"), None);
     }
 
+    // Прежде чем гонять снимки, спрашиваем у сервера примету его состояния.
+    // Если она не менялась с прошлого раза и наша тоже — обмениваться нечем,
+    // и можно не тащить всю базу туда-обратно.
+    let local_tag = {
+        let db = state.db.lock();
+        sync::state_tag(&db)
+    };
+    if let Ok(resp) = client
+        .get(format!("{upstream}/sync/hello"))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(info) = resp.json::<Value>().await {
+                let remote_tag = info
+                    .get("stateTag")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let unchanged = {
+                    let db = state.db.lock();
+                    let seen_remote = sync::kv_get(&db, "sync_seen_remote_tag");
+                    let seen_local = sync::kv_get(&db, "sync_seen_local_tag");
+                    !remote_tag.is_empty()
+                        && seen_remote.as_deref() == Some(remote_tag.as_str())
+                        && seen_local.as_deref() == Some(local_tag.as_str())
+                };
+                if unchanged {
+                    let db = state.db.lock();
+                    let _ = db.execute(
+                        "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
+                        rusqlite::params![chrono::Utc::now().to_rfc3339(), upstream],
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     // 1. Забираем изменения сервера.
     let pulled = client
         .get(format!("{upstream}/sync/journal"))
@@ -532,6 +572,7 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
                 "UPDATE peers SET last_sync=?1, last_error=NULL WHERE url=?2",
                 rusqlite::params![chrono::Utc::now().to_rfc3339(), upstream],
             );
+            sync::kv_set(&db, "sync_seen_local_tag", &sync::state_tag(&db));
         }
         Ok(resp) => {
             let status = resp.status();
@@ -545,6 +586,26 @@ async fn sync_once(client: &reqwest::Client, state: &Arc<AppState>, upstream: &s
         Err(e) => {
             let db = state.db.lock();
             sync::touch_peer_error(&db, upstream, &short_net_error(&e));
+            return;
+        }
+    }
+
+    // Обмен состоялся — запоминаем, каким сервер стал после наших записей.
+    // Пока обе приметы не изменятся, следующие круги пропускаются целиком.
+    if let Ok(resp) = client
+        .get(format!("{upstream}/sync/hello"))
+        .bearer_auth(token)
+        .send()
+        .await
+    {
+        if resp.status().is_success() {
+            if let Ok(info) = resp.json::<Value>().await {
+                if let Some(tag) = info.get("stateTag").and_then(Value::as_str) {
+                    let db = state.db.lock();
+                    sync::kv_set(&db, "sync_seen_remote_tag", tag);
+                    sync::kv_set(&db, "sync_seen_local_tag", &sync::state_tag(&db));
+                }
+            }
         }
     }
 }
@@ -612,6 +673,10 @@ async fn main() {
             get(sync_journal_get).post(sync_journal_post),
         )
         .route("/auth/google/callback", get(google_callback))
+        // Вложения лежат файлами на диске, а не строками в базе. Имя файла —
+        // контрольная сумма содержимого, поэтому содержимое по одному адресу
+        // не меняется и его можно кэшировать надолго.
+        .nest_service("/files", ServeDir::new(api::files_dir()))
         .route("/api/trpc/{*procedures}", any(trpc))
         .fallback_service(static_files)
         .with_state(state);

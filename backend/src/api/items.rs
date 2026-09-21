@@ -417,6 +417,75 @@ pub(crate) fn photo_checksum(url: &str) -> String {
     hex::encode(Sha256::digest(url.as_bytes()))
 }
 
+/// Куда складывать вложения. Рядом с базой, если не сказано иное.
+pub fn files_dir() -> std::path::PathBuf {
+    if let Ok(dir) = std::env::var("MESHKEEPER_FILES_DIR") {
+        if !dir.trim().is_empty() {
+            return std::path::PathBuf::from(dir);
+        }
+    }
+    let db = std::env::var("MESHKEEPER_DB").unwrap_or_else(|_| "data/meshkeeper.db".into());
+    std::path::Path::new(&db)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("files")
+}
+
+/// Сохраняет data-URL файлом и возвращает путь, по которому его отдавать.
+///
+/// Раньше снимки лежали в самой базе строками вида `data:image/jpeg;base64,…`.
+/// Одна фотография — сотни килобайт в каждой выборке, раздутый WAL и
+/// резервные копии, которые растут от картинок, а не от учёта. Теперь в базе
+/// остаётся путь, а байты живут на диске.
+///
+/// Имя файла — контрольная сумма содержимого: одинаковые снимки не
+/// дублируются, а подмена файла заметна.
+pub(crate) fn store_data_url(raw: &str) -> Option<String> {
+    use base64::Engine;
+    let rest = raw.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(",")?;
+    if !meta.ends_with(";base64") {
+        return None;
+    }
+    let mime = meta.trim_end_matches(";base64");
+    let ext = match mime {
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "application/pdf" => "pdf",
+        _ => "jpg",
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload.as_bytes())
+        .ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    let sum = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(&bytes);
+        hex::encode(h.finalize())
+    };
+    let dir = files_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        // Не смогли записать на диск — пусть лучше снимок останется в базе,
+        // чем пропадёт совсем.
+        return None;
+    }
+    let name = format!("{sum}.{ext}");
+    let path = dir.join(&name);
+    if !path.exists() && std::fs::write(&path, &bytes).is_err() {
+        return None;
+    }
+    Some(format!("/files/{name}"))
+}
+
+/// Превращает data-URL в путь к файлу, если получится.
+fn as_stored(raw: &str) -> String {
+    store_data_url(raw).unwrap_or_else(|| raw.to_string())
+}
+
 pub(crate) fn insert_photo(
     conn: &Connection,
     item_id: i64,
@@ -424,15 +493,15 @@ pub(crate) fn insert_photo(
     thumb: Option<&str>,
     is_title: bool,
 ) -> Result<i64, ApiError> {
+    // Контрольную сумму считаем по исходному содержимому, до выноса на диск:
+    // по ней проверяют подмену снимка, и она не должна зависеть от того, где
+    // файл в итоге оказался.
+    let checksum = photo_checksum(url);
+    let stored = as_stored(url);
+    let stored_thumb = thumb.map(as_stored).unwrap_or_else(|| stored.clone());
     conn.execute(
         "INSERT INTO item_photos (item_id, url, thumb_url, sha256, is_title) VALUES (?1,?2,?3,?4,?5)",
-        params![
-            item_id,
-            url,
-            thumb.unwrap_or(url),
-            photo_checksum(url),
-            is_title as i64
-        ],
+        params![item_id, stored, stored_thumb, checksum, is_title as i64],
     )?;
     Ok(conn.last_insert_rowid())
 }

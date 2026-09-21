@@ -59,6 +59,19 @@ if [ "$TABLES" -lt 1 ]; then
 fi
 USERS="$(sqlite3 "$TMP/meshkeeper.db" 'SELECT COUNT(*) FROM users;' 2>/dev/null || echo 0)"
 
+# Вложения лежат файлами рядом с базой, а не строками внутри неё. Копия базы
+# без них бесполезна: карточки останутся, снимки пропадут. Кладём в один
+# архив: база + каталог файлов.
+FILES="${MESHKEEPER_FILES_DIR:-$(dirname "$DB")/files}"
+PHOTOS=0
+if [ -d "$FILES" ]; then
+  PHOTOS="$(find "$FILES" -type f | wc -l)"
+  cp -a "$FILES" "$TMP/files"
+fi
+tar -C "$TMP" -cf "$TMP/meshkeeper.tar" meshkeeper.db $([ -d "$TMP/files" ] && echo files)
+rm -rf "$TMP/files"
+mv "$TMP/meshkeeper.tar" "$TMP/meshkeeper.db"
+
 gzip -9 "$TMP/meshkeeper.db"
 OUT="$DEST/meshkeeper-$STAMP.db.gz"
 
@@ -76,13 +89,15 @@ if [ -n "${MESHKEEPER_BACKUP_PASS:-}" ] && command -v openssl >/dev/null 2>&1; t
   openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
     -in "$OUT" -out "$TMP/check.db.gz" -pass env:MESHKEEPER_BACKUP_PASS
   gunzip -f "$TMP/check.db.gz"
-  BACK="$(sqlite3 "$TMP/check.db" 'PRAGMA integrity_check;' 2>&1 | head -1)"
+  mkdir -p "$TMP/check"
+  tar -C "$TMP/check" -xf "$TMP/check.db"
+  BACK="$(sqlite3 "$TMP/check/meshkeeper.db" 'PRAGMA integrity_check;' 2>&1 | head -1)"
   if [ "$BACK" != "ok" ]; then
     echo "копия не восстанавливается: $BACK" >&2
     rm -f "$OUT"
     exit 1
   fi
-  rm -f "$TMP/check.db"
+  rm -rf "$TMP/check" "$TMP/check.db"
 else
   cp "$TMP/meshkeeper.db.gz" "$OUT"
   echo "ВНИМАНИЕ: MESHKEEPER_BACKUP_PASS не задан, копия не зашифрована" >&2
@@ -90,7 +105,7 @@ fi
 
 chmod 600 "$OUT"
 SIZE="$(du -h "$OUT" | cut -f1)"
-echo "копия готова: $OUT ($SIZE, таблиц $TABLES, пользователей $USERS, восстановление проверено)"
+echo "копия готова: $OUT ($SIZE, таблиц $TABLES, пользователей $USERS, вложений $PHOTOS, восстановление проверено)"
 
 # Ротация по количеству копий.
 mapfile -t OLD < <(ls -1t "$DEST"/meshkeeper-*.db.gz* 2>/dev/null | tail -n +"$((KEEP + 1))")

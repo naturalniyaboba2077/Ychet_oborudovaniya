@@ -25,6 +25,8 @@ use faults::*;
 use history::*;
 use inventory::*;
 use items::*;
+// Нужна main.rs, чтобы поднять раздачу вложений.
+pub use items::files_dir;
 use notifications::*;
 use profile::*;
 use reports::*;
@@ -868,6 +870,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_db() -> (Connection, PathBuf, [i64; 3], i64) {
+        // Вложения выносятся на диск, и без этого тесты писали бы их в
+        // рабочее дерево проекта.
+        std::env::set_var(
+            "MESHKEEPER_FILES_DIR",
+            std::env::temp_dir().join("meshkeeper-test-files"),
+        );
         let path = std::env::temp_dir().join(format!("meshkeeper-api-{}.db", Uuid::new_v4()));
         let conn = db::open(&path).expect("test database");
         conn.execute(
@@ -1886,6 +1894,75 @@ mod tests {
         cleanup(conn, path);
     }
 
+    /// «Семья» — однофамильцы одной позиции. Счётчики и держатели нужны и в
+    /// списке, а сам перечень однофамильцев — только карточке: его сборка
+    /// стоит запроса статуса на каждого.
+    #[test]
+    fn family_counts_hold_in_lists_but_members_only_on_the_card() {
+        let (conn, path, users, ws) = test_db();
+        for n in 1..=3 {
+            conn.execute(
+                "INSERT INTO items (title, internal_id, workspace_id, created_at) VALUES ('Перфоратор',?1,?2,?3)",
+                params![format!("ВН-{n:04}"), ws, now()],
+            )
+            .unwrap();
+        }
+        let first: i64 = conn
+            .query_row("SELECT MIN(id) FROM items", [], |r| r.get(0))
+            .unwrap();
+        // Один экземпляр выдан.
+        conn.execute(
+            "UPDATE items SET responsible_user_id=?1 WHERE id=?2",
+            params![users[1], first],
+        )
+        .unwrap();
+
+        let card = jsn::item_json(&conn, first, true).expect("карточка");
+        assert_eq!(card["family"]["total"].as_i64(), Some(3));
+        assert_eq!(card["family"]["inStock"].as_i64(), Some(2));
+        assert_eq!(card["family"]["issued"].as_i64(), Some(1));
+        assert_eq!(
+            card["family"]["members"].as_array().map(|a| a.len()),
+            Some(3),
+            "в карточке перечень однофамильцев нужен"
+        );
+
+        let row = jsn::item_json(&conn, first, false).expect("строка списка");
+        assert_eq!(
+            row["family"]["total"].as_i64(),
+            Some(3),
+            "счётчики нужны и в списке"
+        );
+        assert_eq!(row["family"]["inStock"].as_i64(), Some(2));
+        assert_eq!(row["totalQty"].as_i64(), Some(3));
+        assert_eq!(row["stockQty"].as_i64(), Some(2));
+        assert_eq!(
+            row["family"]["members"].as_array().map(|a| a.len()),
+            Some(0),
+            "в списке перечень не собирается"
+        );
+
+        // Держатель однофамильца виден в списке — на этом держится мини-карточка.
+        let holders = row["holders"].as_array().cloned().unwrap_or_default();
+        assert!(
+            holders
+                .iter()
+                .any(|h| h["userId"].as_i64() == Some(users[1])),
+            "держатель пропал из списка: {holders:?}"
+        );
+        // Форма карточки человека должна остаться прежней.
+        let who = holders
+            .iter()
+            .find(|h| h["userId"].as_i64() == Some(users[1]))
+            .unwrap();
+        assert!(who["user"]["fullName"].is_string(), "нет имени держателя");
+        assert!(
+            who["user"]["roleRights"].is_object(),
+            "форма пользователя поехала"
+        );
+        cleanup(conn, path);
+    }
+
     /// Забытый пароль сбрасывает администратор — самостоятельного
     /// восстановления нет, отправлять новый пароль некуда.
     #[test]
@@ -2799,8 +2876,19 @@ mod tests {
         let item = created["id"].as_i64().unwrap();
 
         let photo = &created["photos"][0];
-        assert_eq!(photo["url"].as_str(), Some(full));
-        assert_eq!(photo["thumbUrl"].as_str(), Some(thumb));
+        // Снимок уезжает файлом на диск, в базе остаётся путь: иначе одна
+        // фотография весит сотни килобайт в каждой выборке.
+        let stored = photo["url"].as_str().unwrap_or_default();
+        assert!(
+            stored.starts_with("/files/"),
+            "снимок должен лежать файлом, а не строкой в базе: {stored}"
+        );
+        let on_disk = files_dir().join(stored.trim_start_matches("/files/"));
+        assert!(on_disk.exists(), "файла нет на диске: {on_disk:?}");
+        assert!(photo["thumbUrl"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("/files/"));
         // Контрольная сумма считается сервером, а не приходит от клиента.
         let expected = photo_checksum(full);
         assert_eq!(photo["sha256"].as_str(), Some(expected.as_str()));
@@ -2815,12 +2903,20 @@ mod tests {
         )
         .unwrap();
         let listed = &list["rows"][0]["photos"][0];
+        // В списке вместо оригинала подставляется миниатюра: это разные файлы,
+        // и в каталоге не должно уезжать полноразмерное изображение.
+        let card_thumb = photo["thumbUrl"].as_str().unwrap_or_default();
         assert_eq!(
             listed["url"].as_str(),
-            Some(thumb),
-            "в списке уехал оригинал"
+            Some(card_thumb),
+            "в списке уехал оригинал вместо миниатюры"
         );
-        assert_eq!(listed["thumbUrl"].as_str(), Some(thumb));
+        assert_ne!(
+            listed["url"].as_str(),
+            Some(stored),
+            "оригинал и миниатюра не должны совпадать"
+        );
+        assert_eq!(listed["thumbUrl"].as_str(), Some(card_thumb));
 
         // В карточке оригинал по-прежнему доступен.
         let card = dispatch(
@@ -2830,7 +2926,11 @@ mod tests {
             Some(users[0]),
         )
         .unwrap();
-        assert_eq!(card["photos"][0]["url"].as_str(), Some(full));
+        assert_eq!(
+            card["photos"][0]["url"].as_str(),
+            Some(stored),
+            "в карточке должен отдаваться оригинал, а не миниатюра"
+        );
         cleanup(conn, path);
     }
 
@@ -2846,9 +2946,13 @@ mod tests {
         )
         .unwrap();
         let photo = &created["photos"][0];
-        assert_eq!(photo["url"].as_str(), Some(url));
-        // Миниатюры нет — подставляется оригинал, карточка не остаётся пустой.
-        assert_eq!(photo["thumbUrl"].as_str(), Some(url));
+        let stored = photo["url"].as_str().unwrap_or_default();
+        assert!(
+            stored.starts_with("/files/"),
+            "снимок должен уехать на диск: {stored}"
+        );
+        // Миниатюры нет — подставляется тот же файл, карточка не пустая.
+        assert_eq!(photo["thumbUrl"].as_str(), Some(stored));
         assert!(photo["sha256"].as_str().is_some());
         cleanup(conn, path);
     }
