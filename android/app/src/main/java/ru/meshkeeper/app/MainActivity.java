@@ -40,6 +40,16 @@ public class MainActivity extends AppCompatActivity {
     private static final String PREFS = "meshkeeper";
     private static final String KEY_RELAY = "relay";
 
+    /**
+     * Адрес сервера, с которым приложение работает по умолчанию.
+     *
+     * Раньше приложение начинало со своего экрана настройки: человек видел
+     * не то, что на сайте, и должен был откуда-то знать адрес. Теперь оно
+     * открывает тот же интерфейс, что и браузер. Экран настройки остался —
+     * на случай другого сервера, — но по умолчанию не показывается.
+     */
+    private static final String DEFAULT_RELAY = "https://31-172-72-140.sslip.io";
+
     private WebView web;
     private View setup;
     private EditText serverUrl;
@@ -86,8 +96,11 @@ public class MainActivity extends AppCompatActivity {
         Button btnLogin = findViewById(R.id.btnLogin);
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
-        serverUrl.setText(prefs.getString(KEY_RELAY, ""));
+        String savedRelay = prefs.getString(KEY_RELAY, DEFAULT_RELAY);
+        serverUrl.setText(savedRelay);
 
+        // Открываемся сразу интерфейсом, как в браузере. Экран настройки
+        // покажется, только если адрес не задан или страница не загрузилась.
         WebSettings s = web.getSettings();
         s.setJavaScriptEnabled(true);
         s.setDomStorageEnabled(true);
@@ -111,6 +124,10 @@ public class MainActivity extends AppCompatActivity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri target = request.getUrl();
                 if (isTrustedLocalOrigin(target)) return false;
+                // Вход через Google должен идти внутри приложения. Если
+                // отправить его во внешний браузер, сессия достанется браузеру:
+                // cookie лягут туда, а приложение останется незалогиненным.
+                if (isGoogleSignIn(target)) return false;
                 if ("https".equalsIgnoreCase(target.getScheme())) {
                     try {
                         startActivity(new Intent(Intent.ACTION_VIEW, target));
@@ -119,6 +136,21 @@ public class MainActivity extends AppCompatActivity {
                     }
                 }
                 return true;
+            }
+
+            @Override
+            public void onReceivedError(WebView view, WebResourceRequest request,
+                                        android.webkit.WebResourceError error) {
+                // Сервер недоступен или адрес неверный: показываем настройку,
+                // а не белый экран, на котором человеку нечего делать.
+                if (request.isForMainFrame()) {
+                    web.setVisibility(View.GONE);
+                    setup.setVisibility(View.VISIBLE);
+                    showSetupHint();
+                    Toast.makeText(MainActivity.this,
+                            "Не удалось открыть сервер. Проверьте адрес и связь.",
+                            Toast.LENGTH_LONG).show();
+                }
             }
 
             @Override
@@ -160,6 +192,12 @@ public class MainActivity extends AppCompatActivity {
         // Вкладка входа: там живёт и вход через Google. Раньше попасть на неё
         // со стартового экрана было нельзя.
         btnLogin.setOnClickListener(v -> openApp("login"));
+
+        // Сразу показываем тот же экран, что и сайт. Настройка адреса
+        // остаётся доступной: кнопка «назад» из интерфейса возвращает сюда.
+        if (!savedRelay.isEmpty()) {
+            loadWeb("login");
+        }
 
         showSetupHint();
         askNotify();
@@ -296,6 +334,25 @@ public class MainActivity extends AppCompatActivity {
      * клиентом сервера. Проверка осталась строгой: схема, хост и порт должны
      * совпасть, всё остальное уходит во внешний браузер.
      */
+    /**
+     * Страницы входа Google, которым разрешено открываться внутри приложения.
+     *
+     * Список узкий намеренно: это исключение из правила «чужое — во внешний
+     * браузер», и расширять его на весь google.com нельзя — тогда любая
+     * ссылка на сервисы Google открывалась бы внутри учётной программы.
+     */
+    private boolean isGoogleSignIn(Uri uri) {
+        if (uri == null || !"https".equalsIgnoreCase(uri.getScheme())) return false;
+        String host = uri.getHost();
+        if (host == null) return false;
+        host = host.toLowerCase(java.util.Locale.ROOT);
+        return host.equals("accounts.google.com")
+                || host.equals("accounts.youtube.com")
+                || host.equals("myaccount.google.com")
+                || host.endsWith(".gstatic.com")
+                || host.equals("ssl.gstatic.com");
+    }
+
     private boolean isTrustedLocalOrigin(Uri uri) {
         if (uri == null || serverOrigin.isEmpty()) return false;
         Uri trusted = Uri.parse(serverOrigin);

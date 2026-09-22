@@ -41,7 +41,7 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:layout_marginTop="4dp"
-                    android:text="Учёт на этом телефоне · P2P по Wi‑Fi"
+                    android:text="Учёт инструмента и ТМЦ"
                     android:textColor="#C9C9F0"
                     android:textSize="13sp" />
             </LinearLayout>
@@ -60,7 +60,7 @@
                 android:id="@+id/lanHint"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="Этот телефон сам ведёт учёт и раздаёт данные по Wi‑Fi. Сервер не обязателен."
+                android:text="Приложение показывает данные вашего сервера. Адрес спросим один раз — дальше он запомнится."
                 android:textColor="#303466"
                 android:textSize="14sp" />
 
@@ -68,7 +68,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="20dp"
-                android:text="Дополнительный сервер (необязательно)"
+                android:text="Адрес сервера"
                 android:textColor="#6B6E9E"
                 android:textSize="13sp"
                 android:textStyle="bold" />
@@ -79,7 +79,7 @@
                 android:layout_height="48dp"
                 android:layout_marginTop="8dp"
                 android:background="@drawable/bg_input"
-                android:hint="пусто = только этот телефон"
+                android:hint="31-172-72-140.sslip.io"
                 android:inputType="textUri"
                 android:paddingStart="16dp"
                 android:paddingEnd="16dp"
@@ -91,7 +91,7 @@
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
                 android:layout_marginTop="8dp"
-                android:text="Если укажете адрес, телефон будет дополнительно синхронизироваться с ним. Создать организацию можно без интернета."
+                android:text="Спросите адрес у администратора вашей организации. Без него приложению неоткуда брать данные."
                 android:textColor="#6B6E9E"
                 android:textSize="13sp" />
 
