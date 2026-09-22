@@ -145,17 +145,25 @@ export default function ToolMiniCard({
           теряется. */}
       {writtenOff && (
         <div className="mt-2.5 rounded-xl border border-danger/40 bg-danger-bg px-2.5 py-2">
-          <div className="flex items-center gap-1.5 text-[12px] font-semibold text-danger">
-            <Clock size={13} strokeWidth={2} className="shrink-0" />
+          {/* Подпись короткая не ради красоты: на телефоне карточки идут в
+              два столбца, и полоса шириной 144 точки. Полная фраза «в архив
+              через 14:15» в неё не влезает — она либо переносится так, что
+              время отрывается от «через» и повисает само, либо, если
+              запретить перенос, просто обрезается справа. */}
+          <div className="flex items-start gap-1.5 text-[12px] font-semibold leading-4 text-danger">
+            <Clock size={13} strokeWidth={2} className="mt-0.5 shrink-0" />
             {msLeft > 0 ? (
-              <>
-                Списан · в архив через{' '}
-                <span className="font-mono-num tabular-nums">{formatMsLeft(msLeft)}</span>
-              </>
+              <span className="min-w-0">
+                Списан
+                <span className="block whitespace-nowrap">
+                  в архив:{' '}
+                  <span className="font-mono-num tabular-nums">{formatMsLeft(msLeft)}</span>
+                </span>
+              </span>
             ) : (
               // Ноль означает и «отсрочка только что вышла», и «открыт
               // архив». Формулировка должна быть верна в обоих случаях.
-              'Списан · в архиве'
+              <span>Списан · в архиве</span>
             )}
           </div>
           {onRestore && (

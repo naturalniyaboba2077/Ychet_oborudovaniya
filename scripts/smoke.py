@@ -1,6 +1,6 @@
 """Сценарии ТЗ через HTTP-API узла. Запускать через scripts/smoke_runner.py."""
 
-import json, os, urllib.error, urllib.parse, urllib.request, http.cookiejar
+import json, os, re, urllib.error, urllib.parse, urllib.request, http.cookiejar
 
 BASE = os.environ.get("MK_BASE", "http://127.0.0.1:8098")
 ORIGIN = BASE
@@ -234,6 +234,30 @@ def status(path):
 check("SPA route /tool/1 returns 200", status("/tool/1") == 200, str(status("/tool/1")))
 check("invite deep link /join returns 200", status("/join?token=abc") == 200, str(status("/join?token=abc")))
 check("missing asset still 404", status("/assets/nope.js") == 404, str(status("/assets/nope.js")))
+
+def cache_header(path):
+    """Что браузеру велено делать с этим ответом."""
+    try:
+        with urllib.request.urlopen(BASE + path, timeout=10) as r:
+            return r.headers.get("cache-control", "")
+    except urllib.error.HTTPError as e:
+        return e.headers.get("cache-control", "") if e.headers else ""
+
+# Заголовков кэша не было вовсе, и браузер решал сам: после выкладки
+# человек продолжал открывать старую сборку. В приложении, где страницу
+# вручную никто не обновляет, это тянулось бы неделями.
+check("страница перепроверяется", "no-cache" in cache_header("/"), cache_header("/"))
+check("глубокая ссылка тоже перепроверяется", "no-cache" in cache_header("/tool/1"), cache_header("/tool/1"))
+index_html = urllib.request.urlopen(BASE + "/", timeout=10).read().decode("utf-8", "replace")
+asset = re.search(r"/assets/index-[A-Za-z0-9_-]+\.js", index_html)
+check("страница ссылается на собранный бандл", asset is not None, index_html[:120])
+if asset:
+    # Хранить бандл долго нельзя: сборщик переиспользует имена. Одно и то же
+    # index-DhbuBn33.js встретилось в двух разных сборках, и браузер показывал
+    # старый каталог, имея на сервере новый. С «immutable» он держал бы его год.
+    head = cache_header(asset.group(0))
+    check("бандл тоже перепроверяется", "no-cache" in head, head)
+    check("бандл не помечен вечным", "immutable" not in head, head)
 opts = Client("anon2").call("auth.options", None, mutation=False)
 check("registration stays open for everyone", opts.get("registrationOpen") is True, str(opts))
 check("bootstrap flag is false", opts.get("bootstrap") is False, str(opts))

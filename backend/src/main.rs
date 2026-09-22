@@ -10,7 +10,7 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State},
     http::{HeaderMap, Method, StatusCode, Uri},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{any, get},
     Json, Router,
 };
@@ -208,6 +208,31 @@ async fn trpc(
         builder = builder.header("set-cookie", cookie);
     }
     builder.body(body.to_string()).unwrap().into_response()
+}
+
+/// Велит браузеру перепроверять файл, а не доставать его из своих запасов.
+///
+/// Заголовка не было вовсе, и браузер решал сам: после выкладки человек
+/// продолжал открывать старую сборку. В приложении, где страницу вручную
+/// никто не обновляет, это тянулось бы неделями.
+///
+/// Файлам в `/assets/` напрашивается «хранить год, не перепроверять» — их
+/// имена выглядят как отпечаток содержимого. Но это проверено и оказалось
+/// неправдой: сборщик выдал одно и то же имя `index-DhbuBn33.js` для двух
+/// разных сборок, и браузер показывал старый каталог, имея на руках новый.
+/// С «immutable» он держал бы этот файл год, и починить это снаружи было бы
+/// нечем. Поэтому перепроверяется всё; ответ при этом почти всегда пустой
+/// (304 по дате изменения), так что стоит это мало.
+async fn static_cache_headers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let mut res = next.run(req).await;
+    res.headers_mut().insert(
+        axum::http::header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-cache"),
+    );
+    res
 }
 
 async fn spa_index(State(index): State<Arc<PathBuf>>, uri: Uri) -> impl IntoResponse {
@@ -757,6 +782,13 @@ async fn main() {
     // ссылка-приглашение выглядела как «страница не найдена».
     let static_files = ServeDir::new(&web_root)
         .fallback(any(spa_index).with_state(Arc::new(web_root.join("index.html"))));
+    // Заголовки кэша приходится навешивать слоем: ServeDir их не ставит
+    // вовсе, и браузер решает сам. На странице это оборачивалось тем, что
+    // после выкладки человек продолжал открывать старую сборку — особенно
+    // в приложении, где страницу никто не обновляет вручную.
+    let static_files = Router::new()
+        .fallback_service(static_files)
+        .layer(axum::middleware::from_fn(static_cache_headers));
     let app = Router::new()
         .route("/health", get(health))
         .route("/sync/hello", get(sync_hello))
