@@ -162,7 +162,7 @@ function fmtThousands(v: string): string {
  * отказе ввод остаётся на экране вместе с набранным текстом — иначе человек
  * потерял бы его из-за случайной ошибки сети.
  */
-function SelectOrCreate({
+export function SelectOrCreate({
   value,
   onChange,
   options,
@@ -195,6 +195,10 @@ function SelectOrCreate({
     try {
       await onCreate(name)
       setDraft(null)
+    } catch {
+      // Сообщение об ошибке показывает вызывающий — здесь важно другое:
+      // не оставить отклонённый промис без обработки и сохранить набранное
+      // на экране, чтобы человек не перенабирал из-за сбоя сети.
     } finally {
       setBusy(false)
     }

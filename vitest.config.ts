@@ -13,12 +13,17 @@ export default defineConfig({
     },
   },
   test: {
-    environment: "node",
+    // jsdom, а не node: интерфейс до сих пор не проверялся ничем, и ошибки в
+    // нём ловились глазами. Часть тестов — про экраны, им нужен браузерный
+    // разбор разметки.
+    environment: "jsdom",
+    globals: true,
     include: [
       "api/**/*.test.ts",
       "api/**/*.spec.ts",
       "src/**/*.test.ts",
       "src/**/*.spec.ts",
+      "src/**/*.test.tsx",
     ],
   },
 });
