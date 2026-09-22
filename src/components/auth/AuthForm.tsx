@@ -679,6 +679,8 @@ function RegisterTab() {
   const navigate = useNavigate()
   const utils = trpc.useUtils()
   const registerMut = trpc.auth.register.useMutation()
+  const googleEnabled =
+    trpc.auth.options.useQuery(undefined, { retry: 0 }).data?.googleEnabled === true
   const [name, setName] = useState('')
   const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
@@ -791,6 +793,42 @@ function RegisterTab() {
 
       <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={6}>
         <SubmitButton state={state}>Создать аккаунт</SubmitButton>
+
+        {googleEnabled && (
+          <>
+            <div className="mt-4 flex items-center gap-3">
+              <span className="h-px flex-1 bg-brand-100" />
+              <span className="text-[13px] text-ink-300">или</span>
+              <span className="h-px flex-1 bg-brand-100" />
+            </div>
+            <div className="mt-4">
+              {/* Вход через Google заводит учётную запись, поэтому его место и
+                  здесь, на регистрации. Раньше кнопка была только на вкладке
+                  входа, и человек, пришедший регистрироваться, её не видел.
+                  Имя и телефон Google не сообщает, а телефон обязателен —
+                  значит поля надо заполнить до перехода. */}
+              <GoogleButton
+                enabled={googleEnabled}
+                phone={phone}
+                fullName={name.trim()}
+                label="Зарегистрироваться через Google"
+                onInvalid={() => {
+                  const next: Record<string, string | undefined> = {}
+                  if (!name.trim()) next.name = 'Введите имя и фамилию'
+                  if (phoneDigits(phone).length !== 11) next.phone = 'Введите телефон полностью'
+                  setErrors(next)
+                  if (Object.keys(next).length > 0) {
+                    setShakeTick((t) => t + 1)
+                    toast.error('Сначала укажите имя и телефон — Google их не сообщает')
+                    return false
+                  }
+                  return true
+                }}
+              />
+            </div>
+          </>
+        )}
+
         <p className="mt-3 text-center text-[13px] leading-5 text-ink-500">
           Организацию создадите следующим шагом — или вступите в чужую по
           приглашению.

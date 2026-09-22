@@ -83,6 +83,7 @@ public class MainActivity extends AppCompatActivity {
         lanHint = findViewById(R.id.lanHint);
         Button btnJoin = findViewById(R.id.btnJoin);
         Button btnCreate = findViewById(R.id.btnCreate);
+        Button btnLogin = findViewById(R.id.btnLogin);
 
         SharedPreferences prefs = getSharedPreferences(PREFS, MODE_PRIVATE);
         serverUrl.setText(prefs.getString(KEY_RELAY, ""));
@@ -156,6 +157,9 @@ public class MainActivity extends AppCompatActivity {
 
         btnJoin.setOnClickListener(v -> openApp("join"));
         btnCreate.setOnClickListener(v -> openApp("register"));
+        // Вкладка входа: там живёт и вход через Google. Раньше попасть на неё
+        // со стартового экрана было нельзя.
+        btnLogin.setOnClickListener(v -> openApp("login"));
 
         showSetupHint();
         askNotify();

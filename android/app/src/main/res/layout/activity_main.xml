@@ -118,6 +118,21 @@
                 android:textColor="#303466"
                 android:textSize="15sp"
                 android:textStyle="bold" />
+
+            <!-- Вход существующей учётной записью, в том числе через Google.
+                 Без этой кнопки приложение открывалось только на QR или на
+                 создании, и человек с готовым аккаунтом не понимал, куда идти. -->
+            <Button
+                android:id="@+id/btnLogin"
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:layout_marginTop="10dp"
+                android:background="@drawable/bg_btn_secondary"
+                android:text="У меня уже есть аккаунт"
+                android:textAllCaps="false"
+                android:textColor="#303466"
+                android:textSize="15sp"
+                android:textStyle="bold" />
         </LinearLayout>
     </LinearLayout>
 
