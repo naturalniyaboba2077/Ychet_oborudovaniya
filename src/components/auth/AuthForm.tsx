@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import type { FormEvent, KeyboardEvent } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { AnimatePresence, motion } from 'framer-motion'
@@ -16,7 +16,6 @@ import { toast } from 'sonner'
 import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
 import { isNativeApp } from '@/lib/app-mode'
-import QrScanner from '@/components/QrScanner'
 
 /* ── Телефонная маска +7 (___) ___-__-__ ── */
 function phoneDigits(raw: string): string {
@@ -838,38 +837,6 @@ function RegisterTab() {
   )
 }
 
-function JoinTab() {
-  const navigate = useNavigate()
-  const onCode = useCallback((value: string) => {
-    const trimmed = value.trim()
-    try {
-      const parsed = JSON.parse(trimmed) as { t?: string; token?: string; server?: string }
-      if (parsed.t === 'join' && parsed.token) {
-        const peer = parsed.server ? `&peer=${encodeURIComponent(parsed.server)}` : ''
-        navigate(`/join?token=${encodeURIComponent(parsed.token)}${peer}`)
-        return
-      }
-    } catch {
-      /* not json */
-    }
-    const joinMatch = trimmed.match(/[?&]token=([^&]+)/)
-    const serverMatch = trimmed.match(/^https?:\/\/[^/?#]+/)
-    if (joinMatch) {
-      const peer = serverMatch ? `&peer=${encodeURIComponent(serverMatch[0])}` : ''
-      navigate(`/join?token=${encodeURIComponent(decodeURIComponent(joinMatch[1]))}${peer}`)
-      return
-    }
-    toast.error('Это не QR-приглашение в группу')
-  }, [navigate])
-  return (
-    <div className="space-y-4">
-      <p className="text-sm text-ink-500">
-        Наведите камеру на QR администратора — вы сразу попадёте в его группу.
-      </p>
-      <QrScanner onCode={onCode} />
-    </div>
-  )
-}
 
 /* ═══════════════ Форма с табами «Вход / Регистрация» ═══════════════ */
 export default function AuthForm() {
@@ -885,33 +852,29 @@ export default function AuthForm() {
     mode === 'register' ? 'register' : mode === 'login' ? 'login' : null,
   )
   const setTab = setChosen
-  const fallbackTab = optionsQ.data?.bootstrap ? 'register' : 'join'
-  const wantedTab = chosen ?? fallbackTab
-  const tab = wantedTab === 'register' && !canRegister ? 'join' : wantedTab
+  // Сначала учётная запись, потом организация. Вкладки «QR-код» здесь больше
+  // нет: она заводила аккаунт и вступала в группу одним действием — ровно то,
+  // от чего мы ушли, разделив эти шаги. Сканирование приглашения переехало
+  // на экран выбора организации, куда человек попадает уже войдя.
+  const fallbackTab = optionsQ.data?.bootstrap ? 'register' : 'login'
+  const wantedTab = chosen === 'join' ? 'login' : (chosen ?? fallbackTab)
+  const tab = wantedTab === 'register' && !canRegister ? 'login' : wantedTab
   const tabs = canRegister
     ? [
-        { id: 'join' as const, label: 'QR-код' },
         { id: 'login' as const, label: 'Вход' },
         { id: 'register' as const, label: 'Создать аккаунт' },
       ]
-    : [
-        { id: 'join' as const, label: 'QR-код' },
-        { id: 'login' as const, label: 'Вход' },
-      ]
+    : [{ id: 'login' as const, label: 'Вход' }]
 
   return (
     <div className="w-full max-w-[400px]">
       <h1 className="text-[28px] leading-9 font-bold tracking-[-0.01em] text-ink-900">
-        {tab === 'join' ? 'Присоединиться' : tab === 'login' ? 'Вход в MeshKeeper' : 'Новая организация'}
+        {tab === 'login' ? 'Вход в MeshKeeper' : 'Новый аккаунт'}
       </h1>
       <p className="mt-1 text-sm text-ink-500">
-        {app
-          ? 'Этот телефон — узел учёта. Сервер не нужен: коллеги подключаются по QR в той же Wi‑Fi.'
-          : optionsQ.data?.bootstrap
-            ? 'База пустая: создайте организацию — вы станете её владельцем.'
-            : canRegister
-              ? 'Присоединяйтесь по QR, войдите или создайте новую организацию.'
-              : 'Организация уже создана. Присоединиться можно по QR-приглашению администратора.'}
+        {tab === 'login'
+          ? 'Войдите — организацию выберете следующим шагом.'
+          : 'Сначала аккаунт. Потом создадите свою организацию или вступите в чужую по приглашению.'}
       </p>
 
       <div className="mt-6 flex border-b border-brand-100">
@@ -947,7 +910,7 @@ export default function AuthForm() {
             exit={{ opacity: 0 }}
             transition={{ duration: 0.2 }}
           >
-            {tab === 'join' ? <JoinTab /> : tab === 'login' ? <LoginTab /> : <RegisterTab />}
+            {tab === 'login' ? <LoginTab /> : <RegisterTab />}
           </motion.div>
         </AnimatePresence>
       </div>

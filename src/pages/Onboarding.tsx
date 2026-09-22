@@ -13,6 +13,7 @@
 import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { Building2, Loader2, QrCode } from 'lucide-react'
+import QrScanner from '@/components/QrScanner'
 import { toast } from 'sonner'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
@@ -48,6 +49,29 @@ export default function Onboarding() {
   const [name, setName] = useState('')
   const [timezone, setTimezone] = useState('Europe/Moscow')
   const [token, setToken] = useState('')
+
+  /** Разбирает QR приглашения: и ссылку, и вложенный JSON. */
+  const onScanned = (value: string) => {
+    const trimmed = value.trim()
+    try {
+      const parsed = JSON.parse(trimmed) as { t?: string; token?: string }
+      if (parsed.t === 'join' && parsed.token) {
+        setToken(parsed.token)
+        join.mutate({ token: parsed.token })
+        return
+      }
+    } catch {
+      /* не JSON — ниже попробуем как ссылку */
+    }
+    const match = trimmed.match(/[?&]token=([^&]+)/)
+    if (match) {
+      const found = decodeURIComponent(match[1])
+      setToken(found)
+      join.mutate({ token: found })
+      return
+    }
+    toast.error('Это не QR-приглашение в группу')
+  }
 
   const create = trpc.auth.createWorkspace.useMutation({
     onSuccess: async () => {
@@ -215,6 +239,16 @@ export default function Onboarding() {
               <p className="mt-1 text-xs text-ink-500">
                 Если у вас ссылка с QR — просто откройте её, код подставится сам
               </p>
+            </div>
+
+            {/* Сканер живёт здесь, а не на экране входа: вступают в группу
+                уже войдя, иначе получалось бы, что приглашение заодно заводит
+                учётную запись — именно от этого мы и ушли. */}
+            <div>
+              <p className="mb-2 text-[13px] font-semibold text-ink-900">
+                Или наведите камеру на QR
+              </p>
+              <QrScanner onCode={onScanned} />
             </div>
             <button
               disabled={join.isPending}
