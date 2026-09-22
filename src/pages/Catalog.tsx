@@ -25,7 +25,11 @@ import { trpc } from '@/providers/trpc'
 import { parseDueInput } from '@/lib/due-date'
 import { mapItemToCatalogTool, type CatalogTool } from '@/lib/catalog-item'
 import { useStore } from '@/lib/store'
+import { useCan } from '@/lib/rights'
+import { WRITE_OFF_GRACE_MINUTES } from '@/lib/write-off'
+import { askStatusReason, statusNeedsReason } from '@/lib/status-reason'
 import ToolMiniCard from '@/components/ToolMiniCard'
+import WriteOffDialog from '@/components/WriteOffDialog'
 
 interface Filters {
   assignees: number[]
@@ -51,10 +55,6 @@ const countFilters = (f: Filters) =>
   f.assignees.length + f.sites.length + f.warehouses.length + f.categories.length + f.brands.length + f.statuses.length + (f.qr ? 1 : 0)
 
 type SortKey = 'new' | 'name' | 'vn' | 'price'
-/** Столько минут списанный предмет ещё виден в каталоге. Должно совпадать
- *  с WRITE_OFF_GRACE_MINUTES на сервере: расхождение собьёт обратный отсчёт. */
-const WRITE_OFF_GRACE_MINUTES = 15
-
 type ViewMode = 'grid' | 'table'
 
 const PAGE_SIZE = 8
@@ -201,8 +201,18 @@ export default function Catalog() {
   } = useStore()
 
   const utils = trpc.useUtils()
+  const can = useCan()
+  // Архив — не фильтр, а отдельный список: списанные предметы не должны
+  // попадаться в работе, но и пропадать бесследно им нельзя.
+  const [archive, setArchive] = useState(false)
   const listQ = trpc.items.list.useQuery(
-    { page: 1, limit: FETCH_LIMIT, sort: 'createdAt_desc', workspaceId: workspace?.id },
+    {
+      page: 1,
+      limit: FETCH_LIMIT,
+      sort: 'createdAt_desc',
+      workspaceId: workspace?.id,
+      archived: archive,
+    },
     { enabled: Boolean(workspace?.id) },
   )
   const usersQ = trpc.admin.users.list.useQuery({})
@@ -532,6 +542,73 @@ export default function Catalog() {
 
   const writeOff = trpc.history.writeOff.useMutation()
 
+  // Смена статуса пачкой. Раньше кнопка только показывала название
+  // выбранного статуса, ничего не меняя.
+  // Печать грузится по нажатию: лист этикеток собирается серверным
+  // рендерером React, а это почти двести килобайт. Каталог открывают
+  // каждый день, печатают — раз в месяц, и платить за это трафиком с
+  // телефона при каждом заходе незачем.
+  const printSelected = async () => {
+    const { printQrLabels } = await import('@/lib/print-qr')
+    const problem = printQrLabels(
+      tools
+        .filter((t) => selectedToolIds.has(t.id))
+        // Нет QR — печатаем внутренний номер: сканер приложения
+        // распознаёт и его.
+        .map((t) => ({ code: t.qrCode ?? t.vn, vn: t.vn, name: t.name })),
+    )
+    if (problem) setToast(problem)
+  }
+
+  const updateItem = trpc.items.update.useMutation()
+  const bulkSetStatus = async (statusId: number) => {
+    const status = statuses.find((s) => s.id === statusId)
+    const name = status?.name ?? ''
+    const ids = [...selectedToolIds].map(Number).filter((n) => Number.isFinite(n) && n > 0)
+    if (ids.length === 0) return
+    let reason: string | undefined
+    if (statusNeedsReason(status?.slug)) {
+      const answer = askStatusReason(name)
+      if (!answer) {
+        setToast('Без причины статус не меняем — нужно минимум 3 символа')
+        return
+      }
+      reason = answer
+    }
+    const failed: string[] = []
+    for (const id of ids) {
+      try {
+        await updateItem.mutateAsync({ id, statusId, reason })
+      } catch (e) {
+        failed.push(e instanceof Error ? e.message : 'неизвестная ошибка')
+      }
+    }
+    await utils.items.list.invalidate()
+    clearSelection()
+    setToast(
+      failed.length === 0
+        ? `Статус изменён: ${name} (${ids.length} ед.)`
+        : `Изменено ${ids.length - failed.length}, не удалось ${failed.length}: ${failed[0]}`,
+    )
+  }
+
+  // Возврат из списания. Пока идёт отсрочка — прямо из каталога, дальше —
+  // из архива; действие одно и то же, поэтому и обработчик один.
+  const [restoringId, setRestoringId] = useState<number | null>(null)
+  const restore = trpc.items.restore.useMutation()
+  const doRestore = async (tool: CatalogTool) => {
+    setRestoringId(tool.numericId)
+    try {
+      await restore.mutateAsync({ id: tool.numericId })
+      await utils.items.list.invalidate()
+      setToast(`«${tool.name}» вернули в каталог`)
+    } catch (e) {
+      setToast(e instanceof Error ? e.message : 'Не удалось вернуть')
+    } finally {
+      setRestoringId(null)
+    }
+  }
+
   const doWriteOff = async () => {
     const ids = [...selectedToolIds].map(Number).filter((n) => Number.isFinite(n) && n > 0)
     if (ids.length === 0) return
@@ -581,10 +658,42 @@ export default function Catalog() {
           transition={{ duration: 0.28, ease: [0.22, 1, 0.36, 1] }}
         >
           <h1 className="text-2xl lg:text-[28px] leading-9 font-bold tracking-[-0.01em] text-ink-900">
-            Все инструменты{' '}
-            <span className="font-mono-num text-ink-500 font-semibold">({listQ.data?.total ?? tools.length} ед.)</span>
+            {archive ? 'Архив' : 'Все инструменты'}{' '}
+            <span className="font-mono-num text-ink-500 font-semibold">
+              ({archive ? tools.length : (listQ.data?.total ?? tools.length)} ед.)
+            </span>
           </h1>
         </motion.div>
+        {/* Каталог и архив — два списка одного экрана. Отдельной страницей
+            архив заводить незачем: фильтры, поиск и вид у них общие. */}
+        <div className="flex rounded-xl border border-brand-100 bg-white p-1">
+          {([
+            { v: false, label: 'Каталог' },
+            { v: true, label: 'Архив' },
+          ]).map((opt) => (
+            <button
+              key={String(opt.v)}
+              onClick={() => {
+                setArchive(opt.v)
+                clearSelection()
+                setVisible(PAGE_SIZE)
+              }}
+              className={cn(
+                'relative h-8 px-3.5 rounded-lg text-[13px] font-semibold transition-colors',
+                archive === opt.v ? 'text-white' : 'text-ink-500 hover:text-ink-900',
+              )}
+            >
+              {archive === opt.v && (
+                <motion.span
+                  layoutId="catalog-archive-pill"
+                  className="absolute inset-0 rounded-lg bg-brand-600"
+                  transition={{ duration: 0.2 }}
+                />
+              )}
+              <span className="relative z-10">{opt.label}</span>
+            </button>
+          ))}
+        </div>
         <div className="flex-1" />
         <motion.div
           initial={{ opacity: 0, y: 16 }}
@@ -694,11 +803,12 @@ export default function Catalog() {
             </button>
             <select
               defaultValue=""
+              disabled={updateItem.isPending}
               onChange={(e) => {
-                if (e.target.value) setToast(`Статус: ${statuses.find((s) => String(s.id) === e.target.value)?.name ?? ''}`)
+                if (e.target.value) void bulkSetStatus(Number(e.target.value))
                 e.target.value = ''
               }}
-              className="h-8 rounded-xl border border-brand-100 bg-white px-2.5 text-[13px] font-semibold text-ink-900"
+              className="h-8 rounded-xl border border-brand-100 bg-white px-2.5 text-[13px] font-semibold text-ink-900 disabled:opacity-60"
             >
               <option value="" disabled>
                 Изменить статус
@@ -710,19 +820,24 @@ export default function Catalog() {
               ))}
             </select>
             <button
-              onClick={() => setToast('QR-коды отправлены на печать')}
+              onClick={() => void printSelected()}
               className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-brand-100 bg-white text-[13px] font-semibold text-ink-900 hover:bg-brand-50 transition"
             >
               <QrCode size={14} />
               Печать QR
             </button>
-            <button
-              onClick={() => setWriteOffOpen(true)}
-              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-danger text-[13px] font-semibold text-danger hover:bg-danger-bg transition"
-            >
-              <Trash2 size={14} />
-              Списать всё
-            </button>
+            {/* Кнопку видит только тот, кто может списывать. Раньше её
+                показывали всем, сервер отвечал «списание доступно только
+                руководителю», и человек считал это поломкой. */}
+            {can('writeOff') && (
+              <button
+                onClick={() => setWriteOffOpen(true)}
+                className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-danger text-[13px] font-semibold text-danger hover:bg-danger-bg transition"
+              >
+                <Trash2 size={14} />
+                Списать всё
+              </button>
+            )}
           </motion.div>
         ) : (
           /* ── Секция 2. Панель инструментов ── */
@@ -889,14 +1004,33 @@ export default function Catalog() {
             className="bg-surface rounded-card border border-brand-100/60 shadow-card py-12 px-6 flex flex-col items-center text-center"
           >
             <img src="/empty-catalog.svg" alt="" className="w-60 h-auto rounded-2xl" />
-            <h3 className="mt-5 text-[17px] font-semibold text-ink-900">Ничего не найдено</h3>
-            <p className="mt-1 text-[13px] text-ink-500">Попробуйте изменить фильтры или запрос</p>
-            <button
-              onClick={resetAll}
-              className="mt-4 h-10 px-5 rounded-xl text-sm font-semibold text-brand-600 hover:bg-brand-50 transition-colors"
-            >
-              Сбросить фильтры
-            </button>
+            {/* Пустой архив — это норма, а не неудачный поиск. Предлагать
+                сбросить фильтры здесь значит сбивать с толку. */}
+            {archive && activeFilterCount === 0 && !debouncedQuery ? (
+              <>
+                <h3 className="mt-5 text-[17px] font-semibold text-ink-900">Архив пуст</h3>
+                <p className="mt-1 text-[13px] text-ink-500">
+                  Сюда попадает списанное — через {WRITE_OFF_GRACE_MINUTES} минут после списания
+                </p>
+                <button
+                  onClick={() => setArchive(false)}
+                  className="mt-4 h-10 px-5 rounded-xl text-sm font-semibold text-brand-600 hover:bg-brand-50 transition-colors"
+                >
+                  Вернуться в каталог
+                </button>
+              </>
+            ) : (
+              <>
+                <h3 className="mt-5 text-[17px] font-semibold text-ink-900">Ничего не найдено</h3>
+                <p className="mt-1 text-[13px] text-ink-500">Попробуйте изменить фильтры или запрос</p>
+                <button
+                  onClick={resetAll}
+                  className="mt-4 h-10 px-5 rounded-xl text-sm font-semibold text-brand-600 hover:bg-brand-50 transition-colors"
+                >
+                  Сбросить фильтры
+                </button>
+              </>
+            )}
           </motion.div>
         ) : view === 'grid' ? (
           <motion.div
@@ -915,7 +1049,13 @@ export default function Catalog() {
                   viewport={{ once: true, margin: '-40px' }}
                   transition={{ duration: 0.3, delay: (i % 12) * 0.04, ease: [0.22, 1, 0.36, 1] }}
                 >
-                  <ToolMiniCard tool={tool} selectionMode={selectionMode} onCallClick={onCallClick} />
+                  <ToolMiniCard
+                    tool={tool}
+                    selectionMode={selectionMode}
+                    onCallClick={onCallClick}
+                    onRestore={can('writeOff') ? doRestore : undefined}
+                    restoring={restoringId === tool.numericId}
+                  />
                 </motion.div>
               ))}
               {loading &&
@@ -978,63 +1118,15 @@ export default function Catalog() {
         )}
       </AnimatePresence>
 
-      {/* Подтверждение списания. Списание — действие тяжёлое: спрашиваем
-          причину и прямо говорим, что предмет не исчезнет насовсем. */}
-      <AnimatePresence>
-        {writeOffOpen && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="fixed inset-0 z-[70] flex items-center justify-center bg-ink-900/40 px-4"
-            onClick={() => !writingOff && setWriteOffOpen(false)}
-          >
-            <motion.div
-              initial={{ opacity: 0, scale: 0.96, y: 12 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.96, y: 12 }}
-              onClick={(e) => e.stopPropagation()}
-              className="w-full max-w-md rounded-card bg-surface p-5 shadow-modal"
-            >
-              <h3 className="text-lg font-bold text-ink-900">
-                Списать {selectedCount} {selectedCount === 1 ? 'предмет' : 'предметов'}?
-              </h3>
-              <p className="mt-2 text-sm leading-5 text-ink-500">
-                Предметы погаснут в каталоге и через {WRITE_OFF_GRACE_MINUTES} минут уйдут в
-                архив. История выдач сохранится, вернуть их можно и потом.
-              </p>
-              <label className="mt-4 block text-[13px] font-semibold text-ink-900">
-                Причина списания
-              </label>
-              <input
-                autoFocus
-                value={writeOffReason}
-                onChange={(e) => setWriteOffReason(e.target.value)}
-                placeholder="Сломан, утерян, изношен…"
-                className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-surface px-3 text-sm text-ink-900 outline-none focus:border-brand-600 focus:ring-[3px] focus:ring-brand-600/15"
-              />
-              <div className="mt-5 flex justify-end gap-2">
-                <button
-                  type="button"
-                  disabled={writingOff}
-                  onClick={() => setWriteOffOpen(false)}
-                  className="h-10 rounded-xl border border-brand-100 px-4 text-sm font-semibold text-ink-900 hover:bg-brand-50 disabled:opacity-60"
-                >
-                  Отмена
-                </button>
-                <button
-                  type="button"
-                  disabled={writingOff || writeOffReason.trim().length < 3}
-                  onClick={() => void doWriteOff()}
-                  className="h-10 rounded-xl bg-danger px-4 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-60"
-                >
-                  {writingOff ? 'Списываем…' : 'Списать'}
-                </button>
-              </div>
-            </motion.div>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      <WriteOffDialog
+        open={writeOffOpen}
+        count={selectedCount}
+        reason={writeOffReason}
+        onReasonChange={setWriteOffReason}
+        busy={writingOff}
+        onCancel={() => setWriteOffOpen(false)}
+        onConfirm={() => void doWriteOff()}
+      />
     </div>
   )
 }

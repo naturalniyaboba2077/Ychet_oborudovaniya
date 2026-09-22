@@ -1,7 +1,9 @@
 import { Toaster } from 'sonner'
+import { Navigate } from 'react-router'
 import BrandPanel from '@/components/auth/BrandPanel'
 import AuthForm from '@/components/auth/AuthForm'
 import MeshCanvas from '@/components/auth/MeshCanvas'
+import { trpc } from '@/providers/trpc'
 
 /**
  * Страница входа / регистрации (маршрут /login, без Layout).
@@ -10,6 +12,29 @@ import MeshCanvas from '@/components/auth/MeshCanvas'
  * со скруглением 18px сверху (нахлест -18px).
  */
 export default function Auth() {
+  // Кто уже вошёл, форму видеть не должен. Раньше проверки не было, и это
+  // ломало приложение на телефоне: при запуске оно открывает /login, сессия
+  // жива, но человек всё равно видит поля входа — и думает, что его
+  // «выкинуло», хотя он никуда не выходил.
+  const meQ = trpc.auth.me.useQuery(undefined, { retry: 0 })
+  const wsQ = trpc.meta.workspaces.useQuery(undefined, {
+    enabled: !!meQ.data,
+    retry: 0,
+  })
+
+  if (meQ.isLoading) {
+    // Пустой экран на долю секунды лучше, чем форма, которая тут же
+    // исчезнет: мигание выглядит как сбой.
+    return <div className="min-h-[100dvh] bg-surface" role="status" aria-label="Проверяем вход" />
+  }
+  if (meQ.data) {
+    if (wsQ.isLoading) {
+      return <div className="min-h-[100dvh] bg-surface" role="status" aria-label="Загружаем" />
+    }
+    // Аккаунт без организации идёт создавать или вступать, остальные — в каталог.
+    return <Navigate to={wsQ.data && wsQ.data.length === 0 ? '/start' : '/'} replace />
+  }
+
   return (
     <div className="min-h-[100dvh] bg-surface lg:flex">
       {/* Бренд-панель — десктоп (55%) */}

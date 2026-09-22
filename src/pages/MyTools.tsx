@@ -34,6 +34,9 @@ import { trpc } from '@/providers/trpc'
 import { askStatusReason, statusNeedsReason } from '@/lib/status-reason'
 import { cn } from '@/lib/utils'
 import { QrBadge, MaterialBadge, StatusDot, StatusBadge } from '@/components/StatusBadge'
+import PendingResponsibility from '@/components/PendingResponsibility'
+import WriteOffDialog from '@/components/WriteOffDialog'
+import { useCan } from '@/lib/rights'
 
 // ─── Типы из tRPC-контракта ─────────────────────────────────────────────────
 
@@ -720,6 +723,11 @@ export default function MyTools() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [acceptTransfer, setAcceptTransfer] = useState<Transfer | null>(null)
   const [toast, setToast] = useState<string | null>(null)
+  // Списание пачкой: причина обязательна, иначе через месяц никто не
+  // вспомнит, куда делся инструмент.
+  const [writeOffOpen, setWriteOffOpen] = useState(false)
+  const [writeOffReason, setWriteOffReason] = useState('')
+  const [writingOff, setWritingOff] = useState(false)
   const sentinelRef = useRef<HTMLDivElement>(null)
   const searchRef = useRef<HTMLInputElement>(null)
 
@@ -859,6 +867,61 @@ export default function MyTools() {
     if (window.confirm(`Удалить «${item.internalId} ${item.title}» из каталога?`)) {
       removeMutation.mutate({ id: item.id })
     }
+  }
+
+  const can = useCan()
+
+  // Грузим по нажатию: см. тот же приём в каталоге — лист этикеток тянет
+  // за собой серверный рендерер React.
+  const printSelected = async () => {
+    const { printQrLabels } = await import('@/lib/print-qr')
+    const problem = printQrLabels(
+      rows
+        .filter((t) => selectedIds.has(t.id))
+        .map((t) => ({
+          // Нет QR — печатаем внутренний номер: его тоже распознаёт
+          // сканер приложения.
+          code: t.qrCode ?? t.internalId,
+          vn: t.internalId,
+          name: t.title,
+        })),
+    )
+    if (problem) setToast(problem)
+  }
+  const writeOffMutation = trpc.history.writeOff.useMutation()
+
+  const doWriteOff = async () => {
+    const ids = [...selectedIds]
+    const reason = writeOffReason.trim()
+    if (ids.length === 0) return
+    if (reason.length < 3) {
+      setToast('Укажите причину списания')
+      return
+    }
+    setWritingOff(true)
+    let done = 0
+    const failed: string[] = []
+    for (const id of ids) {
+      try {
+        await writeOffMutation.mutateAsync({ itemId: id, comment: reason })
+        done += 1
+      } catch (e) {
+        // Каждую неудачу называем: списание пачкой не должно молча
+        // пропускать предметы.
+        failed.push(e instanceof Error ? e.message : 'неизвестная ошибка')
+      }
+    }
+    await utils.items.list.invalidate()
+    await utils.meta.transferCounts.invalidate()
+    setWritingOff(false)
+    setWriteOffOpen(false)
+    setWriteOffReason('')
+    setSelectedIds(new Set())
+    setToast(
+      failed.length === 0
+        ? `Списано: ${done}. Вернуть можно из архива`
+        : `Списано ${done}, не удалось ${failed.length}: ${failed[0]}`,
+    )
   }
 
   const bulkSetStatus = (statusId: number) => {
@@ -1170,6 +1233,10 @@ export default function MyTools() {
         </motion.div>
       </div>
 
+      {/* Согласие на ответственность. Стоит выше сводки: пока человек не
+          ответил, предмет не выдаётся никому, и висеть это может днями. */}
+      <PendingResponsibility onDone={setToast} />
+
       {/* ── Секция 2. Полоса сводки ── */}
       <div className="flex gap-3 overflow-x-auto snap-x snap-mandatory pb-1 -mx-1 px-1 sm:grid sm:grid-cols-2 sm:overflow-visible xl:grid-cols-4">
         {summary.map((card, i) => (
@@ -1293,19 +1360,24 @@ export default function MyTools() {
               ))}
             </select>
             <button
-              onClick={() => setToast('QR-коды отправлены на печать')}
+              onClick={() => void printSelected()}
               className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-brand-100 bg-white text-[13px] font-semibold text-ink-900 hover:bg-brand-50 transition"
             >
               <QrCode size={14} />
               Печать QR
             </button>
-            <button
-              onClick={() => setToast('Списание доступно руководителю')}
-              className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-danger text-[13px] font-semibold text-danger hover:bg-danger-bg transition"
-            >
-              <Trash2 size={14} />
-              Списать
-            </button>
+            {/* Кнопку видит только тот, кому списание разрешено. Раньше она
+                была у всех и показывала надпись «Списание доступно
+                руководителю» — списания при этом не происходило ни у кого. */}
+            {can('writeOff') && (
+              <button
+                onClick={() => setWriteOffOpen(true)}
+                className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-danger text-[13px] font-semibold text-danger hover:bg-danger-bg transition"
+              >
+                <Trash2 size={14} />
+                Списать
+              </button>
+            )}
           </motion.div>
         ) : (
           <motion.div
@@ -1608,6 +1680,16 @@ export default function MyTools() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      <WriteOffDialog
+        open={writeOffOpen}
+        count={selectedIds.size}
+        reason={writeOffReason}
+        onReasonChange={setWriteOffReason}
+        busy={writingOff}
+        onCancel={() => setWriteOffOpen(false)}
+        onConfirm={() => void doWriteOff()}
+      />
     </div>
   )
 }

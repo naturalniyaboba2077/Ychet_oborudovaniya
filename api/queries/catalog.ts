@@ -1,11 +1,20 @@
 import { getDb } from "./connection";
 import { workspaces, storages, buildingSites, categories, brands, statuses } from "@db/schema";
+import type { Workspace, RoleRights } from "@db/schema";
 import { and, eq } from "drizzle-orm";
 
 // ─── Рабочие пространства ────────────────────────────────────────────────────
 
-export async function findWorkspaces() {
-  return getDb().query.workspaces.findMany({ orderBy: (w, { asc }) => [asc(w.id)] });
+/**
+ * Пространства текущего пользователя вместе с его правами в каждом.
+ *
+ * Права приходят именно отсюда, а не из профиля: в одном аккаунте человек
+ * может быть руководителем в своей бригаде и рядовым в чужой. `null` — для
+ * запроса без входа.
+ */
+export async function findWorkspaces(): Promise<Array<Workspace & { rights: RoleRights | null }>> {
+  const rows = await getDb().query.workspaces.findMany({ orderBy: (w, { asc }) => [asc(w.id)] });
+  return rows.map((w) => ({ ...w, rights: null as RoleRights | null }));
 }
 
 export async function getDefaultWorkspaceId(): Promise<number> {

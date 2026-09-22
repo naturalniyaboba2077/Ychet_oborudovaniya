@@ -14,6 +14,10 @@ export type ItemListFilter = {
   statusId?: number;
   hasQr?: boolean;
   onlyMineUserId?: number;
+  // true — только списанные (после отсрочки), false/не задано — только живые.
+  archived?: boolean;
+  // id того, кто ждёт подтверждения ответственности.
+  pendingMine?: number;
   page?: number;
   limit?: number;
   sort?: "createdAt_desc" | "createdAt_asc" | "title_asc" | "title_desc" | "internalId_asc";
@@ -37,6 +41,10 @@ export async function findItems(filter: ItemListFilter) {
   if (filter.statusId) conds.push(eq(items.statusId, filter.statusId));
   if (filter.hasQr === true) conds.push(isNotNull(items.qrCode));
   if (filter.hasQr === false) conds.push(isNull(items.qrCode));
+  // Отсрочка считается на сервере от written_off_at; здесь важна только
+  // сама развилка «архив / каталог».
+  conds.push(filter.archived ? isNotNull(items.writtenOffAt) : isNull(items.writtenOffAt));
+  if (filter.pendingMine) conds.push(eq(items.pendingResponsibleId, filter.pendingMine));
 
   const orderBy =
     filter.sort === "createdAt_asc"

@@ -144,6 +144,17 @@ export const items = sqliteTable(
     notifyDate: tsNull("notify_date"),
     dueAt: text("due_at"),
     createdAt: ts("created_at"),
+    guid: text("guid"),
+    calibratedUntil: text("calibrated_until"),
+    minQuantity: real("min_quantity"),
+    // Списание с отсрочкой: пока метка стоит, но 15 минут не прошло, предмет
+    // виден в каталоге серым и его можно вернуть одной кнопкой. Ошибиться
+    // тут легко, а восстанавливать из архива задним числом — долго.
+    writtenOffAt: text("written_off_at"),
+    // Назначенный ответственный, который ещё не подтвердил. До подтверждения
+    // предмет не выдаётся: иначе вещь числилась бы за человеком, который о
+    // ней не знает.
+    pendingResponsibleId: integer("pending_responsible_id"),
   },
   (t) => [
     index("items_ws_idx").on(t.workspaceId),

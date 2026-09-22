@@ -27,9 +27,22 @@ pub(crate) fn workspaces_list(conn: &Connection) -> ApiResult {
                 .unwrap_or_default()
         }
     });
+    // Права кладём рядом с пространством, а не берём из профиля: в разных
+    // организациях одного аккаунта они разные. Без этого интерфейс рисовал
+    // кнопки по правам из первой попавшейся группы, человек нажимал — и
+    // получал отказ сервера, не понимая, за что.
+    let uid = CURRENT_UID.with(|c| c.get());
     Ok(Value::Array(
         ids.into_iter()
-            .filter_map(|id| jsn::workspace_json(conn, id))
+            .filter_map(|id| {
+                let mut ws = jsn::workspace_json(conn, id)?;
+                let rights = match uid {
+                    Some(uid) => merged_rights(conn, uid, id),
+                    None => Value::Null,
+                };
+                ws.as_object_mut()?.insert("rights".into(), rights);
+                Some(ws)
+            })
             .collect(),
     ))
 }
@@ -69,6 +82,10 @@ pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>)
         .map(|q| q.trim().to_lowercase())
         .filter(|q| !q.is_empty());
     let only_mine = b(input, "onlyMine").unwrap_or(false);
+    // Предметы, где человека назначили ответственным, но он ещё не
+    // согласился. Без отдельного отбора найти их можно было бы только по
+    // уведомлению — а уведомление легко пролистать.
+    let pending_mine = b(input, "pendingMine").unwrap_or(false);
     // Архив показывается отдельным списком: в каталоге списанному предмету не
     // место, но и пропадать бесследно он не должен.
     let archived = b(input, "archived").unwrap_or(false);
@@ -89,6 +106,12 @@ pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>)
         // user_id может отсутствовать: тогда «моих» предметов нет вовсе.
         where_sql.push_str(match user_id {
             Some(_) => " AND responsible_user_id = ?2",
+            None => " AND 0",
+        });
+    }
+    if pending_mine {
+        where_sql.push_str(match user_id {
+            Some(_) => " AND pending_responsible_id = :me",
             None => " AND 0",
         });
     }
@@ -118,6 +141,14 @@ pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>)
             args.push(Box::new(uid));
         }
     }
+    let where_sql = match (pending_mine, user_id) {
+        (true, Some(uid)) => {
+            let idx = args.len() + 1;
+            args.push(Box::new(uid));
+            where_sql.replace(":me", &format!("?{idx}"))
+        }
+        _ => where_sql,
+    };
     let where_sql = match &pattern {
         Some(_) => {
             let idx = args.len() + 1;

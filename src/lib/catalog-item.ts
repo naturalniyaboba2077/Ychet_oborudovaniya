@@ -29,6 +29,10 @@ export type CatalogTool = {
   serial?: string | null
   createdAt: string
   dueAt?: string | null
+  /** Момент списания. Пока отсрочка не вышла, предмет ещё в каталоге — серым. */
+  writtenOffAt?: string | null
+  /** Кому предложили ответственность, но он её ещё не подтвердил. */
+  pendingResponsibleId?: number | null
   stockQty?: number | null
   issuedQty?: number | null
   totalQty?: number | null
@@ -58,6 +62,8 @@ export function mapItemToCatalogTool(row: {
   serialNumber: string | null
   createdAt: Date | string
   dueAt?: string | null
+  writtenOffAt?: string | null
+  pendingResponsibleId?: number | null
   photos?: Photo[]
   category?: Named | null
   brand?: Named | null
@@ -103,6 +109,8 @@ export function mapItemToCatalogTool(row: {
     serial: row.serialNumber,
     createdAt,
     dueAt: row.dueAt ?? null,
+    writtenOffAt: row.writtenOffAt ?? null,
+    pendingResponsibleId: row.pendingResponsibleId ?? null,
     stockQty: row.stockQty ?? null,
     issuedQty: row.issuedQty ?? null,
     totalQty: row.totalQty ?? null,

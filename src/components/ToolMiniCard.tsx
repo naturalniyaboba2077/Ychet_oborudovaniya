@@ -1,22 +1,38 @@
 import { useRef } from 'react'
 import { useNavigate } from 'react-router'
-import { Building2, Phone, Warehouse } from 'lucide-react'
+import { Building2, Clock, Phone, RotateCcw, UserCheck, Warehouse } from 'lucide-react'
 import { motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import type { CatalogTool } from '@/lib/catalog-item'
 import { QrBadge, MaterialBadge } from '@/components/StatusBadge'
 import { useStore } from '@/lib/store'
+import { formatMsLeft, useWriteOffCountdown } from '@/lib/write-off'
 
 interface Props {
   tool: CatalogTool
   selectionMode?: boolean
   onCallClick?: (tool: CatalogTool) => void
+  /** Показывается на списанном предмете, пока идёт отсрочка. */
+  onRestore?: (tool: CatalogTool) => void
+  restoring?: boolean
 }
 
-export default function ToolMiniCard({ tool, selectionMode = false, onCallClick }: Props) {
+export default function ToolMiniCard({
+  tool,
+  selectionMode = false,
+  onCallClick,
+  onRestore,
+  restoring = false,
+}: Props) {
   const navigate = useNavigate()
   const { selectedToolIds, toggleToolSelected, setSelectionMode } = useStore()
   const selected = selectedToolIds.has(tool.id)
+
+  // Списанный предмет ещё виден, но уже не живой: серый, с обратным
+  // отсчётом и кнопкой вернуть. Выделять его в пачку незачем — списывать
+  // второй раз нечего.
+  const msLeft = useWriteOffCountdown(tool.writtenOffAt)
+  const writtenOff = msLeft !== null
 
   const openCard = () => navigate(`/tool/${tool.numericId}`)
 
@@ -34,6 +50,7 @@ export default function ToolMiniCard({ tool, selectionMode = false, onCallClick 
   const heldRef = useRef(false)
 
   const startHold = () => {
+    if (writtenOff) return
     heldRef.current = false
     holdTimer.current = window.setTimeout(() => {
       heldRef.current = true
@@ -60,7 +77,7 @@ export default function ToolMiniCard({ tool, selectionMode = false, onCallClick 
       heldRef.current = false
       return
     }
-    if (selectionMode) {
+    if (selectionMode && !writtenOff) {
       toggleToolSelected(tool.id)
       return
     }
@@ -80,9 +97,15 @@ export default function ToolMiniCard({ tool, selectionMode = false, onCallClick 
       className={cn(
         'group relative bg-surface rounded-mini border shadow-card p-3 cursor-pointer transition-shadow hover:shadow-hover',
         selected ? 'border-brand-600 ring-2 ring-brand-600/20' : 'border-brand-100/60',
+        writtenOff && 'border-dashed border-ink-300/70 bg-brand-50/40 shadow-none',
       )}
     >
-      <div className="relative overflow-hidden rounded-[10px] aspect-[4/3] bg-brand-50">
+      <div
+        className={cn(
+          'relative overflow-hidden rounded-[10px] aspect-[4/3] bg-brand-50',
+          writtenOff && 'grayscale opacity-55',
+        )}
+      >
         <img
           src={tool.photo}
           alt={tool.name}
@@ -99,6 +122,7 @@ export default function ToolMiniCard({ tool, selectionMode = false, onCallClick 
               ? 'bg-brand-600 border-brand-600 opacity-100'
               : 'border-brand-100 opacity-0 group-hover:opacity-100',
             (selectionMode || selected) && 'opacity-100',
+            writtenOff && 'hidden',
           )}
         >
           {selected && (
@@ -115,7 +139,52 @@ export default function ToolMiniCard({ tool, selectionMode = false, onCallClick 
         )}
       </div>
 
-      <div className="pt-2.5 space-y-1.5">
+      {/* Полоса списания. Живёт над остальным содержимым, чтобы её нельзя
+          было не заметить: у человека пятнадцать минут на то, чтобы
+          передумать, и в каталоге на сотню карточек бледная подпись внизу
+          теряется. */}
+      {writtenOff && (
+        <div className="mt-2.5 rounded-xl border border-danger/40 bg-danger-bg px-2.5 py-2">
+          <div className="flex items-center gap-1.5 text-[12px] font-semibold text-danger">
+            <Clock size={13} strokeWidth={2} className="shrink-0" />
+            {msLeft > 0 ? (
+              <>
+                Списан · в архив через{' '}
+                <span className="font-mono-num tabular-nums">{formatMsLeft(msLeft)}</span>
+              </>
+            ) : (
+              // Ноль означает и «отсрочка только что вышла», и «открыт
+              // архив». Формулировка должна быть верна в обоих случаях.
+              'Списан · в архиве'
+            )}
+          </div>
+          {onRestore && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation()
+                onRestore(tool)
+              }}
+              disabled={restoring}
+              className="mt-1.5 inline-flex items-center gap-1.5 h-7 px-2.5 rounded-lg bg-white border border-danger/40 text-[12px] font-semibold text-danger hover:bg-white/70 disabled:opacity-60 transition-colors"
+            >
+              <RotateCcw size={12} strokeWidth={2} />
+              {restoring ? 'Возвращаем…' : 'Вернуть'}
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Ответственного назначили, но он ещё не согласился. До согласия
+          предмет не выдаётся, и знать об этом надо до того, как за ним
+          пришли. */}
+      {!writtenOff && tool.pendingResponsibleId != null && (
+        <div className="mt-2.5 flex items-center gap-1.5 rounded-xl border border-amber-300/70 bg-amber-50 px-2.5 py-1.5 text-[12px] font-semibold text-amber-800">
+          <UserCheck size={13} strokeWidth={2} className="shrink-0" />
+          Ждёт подтверждения ответственного
+        </div>
+      )}
+
+      <div className={cn('pt-2.5 space-y-1.5', writtenOff && 'opacity-60')}>
         <div className="flex items-center justify-between gap-2">
           <span className="font-mono-num text-ink-500">{tool.vn}</span>
           <span className="inline-flex items-center gap-1.5 text-xs font-semibold" style={{ color: tool.statusColor }}>

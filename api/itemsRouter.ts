@@ -33,6 +33,8 @@ const listInput = z.object({
   // Списанные предметы живут отдельным списком: в каталоге им не место,
   // но и пропадать бесследно они не должны.
   archived: z.boolean().optional(),
+  // Предметы, где меня назначили ответственным, но я ещё не согласился.
+  pendingMine: z.boolean().optional(),
   page: z.number().int().min(1).default(1),
   limit: z.number().int().min(1).max(500).default(20),
   sort: z
@@ -43,7 +45,7 @@ const listInput = z.object({
 export const itemsRouter = createRouter({
   list: publicQuery.input(listInput).query(async ({ ctx, input }) => {
     const workspaceId = input.workspaceId ?? (await getDefaultWorkspaceId());
-    const me = input.onlyMine ? await requireMe(ctx) : null;
+    const me = input.onlyMine || input.pendingMine ? await requireMe(ctx) : null;
     const result = await findItems({
       workspaceId,
       search: input.search,
@@ -55,6 +57,8 @@ export const itemsRouter = createRouter({
       statusId: input.statusId,
       hasQr: input.hasQr,
       onlyMineUserId: me?.id,
+      archived: input.archived,
+      pendingMine: input.pendingMine ? me?.id : undefined,
       page: input.page,
       limit: input.limit,
       sort: input.sort,

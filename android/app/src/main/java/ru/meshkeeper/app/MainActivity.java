@@ -200,7 +200,7 @@ public class MainActivity extends AppCompatActivity {
         // Сразу показываем тот же экран, что и сайт. Настройка адреса
         // остаётся доступной: кнопка «назад» из интерфейса возвращает сюда.
         if (!savedRelay.isEmpty()) {
-            loadWeb("login");
+            loadHome();
         }
 
         showSetupHint();
@@ -278,6 +278,29 @@ public class MainActivity extends AppCompatActivity {
     private void openApp(String mode) {
         pendingMode = mode;
         loadWeb(mode);
+    }
+
+    /**
+     * Открывает корень приложения и даёт ему самому решить, куда вести.
+     *
+     * При запуске нельзя открывать /login: сессия живёт тридцать дней, и
+     * человек, который никуда не выходил, видел бы поля входа при каждом
+     * открытии. Корень сам уводит на вход, если сессии нет.
+     */
+    private void loadHome() {
+        String relay;
+        try {
+            relay = normalizeRelay(serverUrl.getText().toString());
+        } catch (IllegalArgumentException e) {
+            Toast.makeText(this, e.getMessage(), Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (relay.isEmpty()) return;
+        getSharedPreferences(PREFS, MODE_PRIVATE).edit().putString(KEY_RELAY, relay).apply();
+        serverOrigin = relay;
+        setup.setVisibility(View.GONE);
+        web.setVisibility(View.VISIBLE);
+        web.loadUrl(relay + "/?app=1");
     }
 
     private void loadWeb(String mode) {

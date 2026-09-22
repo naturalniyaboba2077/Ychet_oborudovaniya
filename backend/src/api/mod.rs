@@ -2461,6 +2461,49 @@ mod tests {
             "выдача до подтверждения должна быть закрыта"
         );
 
+        // Назначенный должен найти такой предмет списком, а не вылавливать
+        // его из ленты уведомлений: уведомление легко пролистать, и тогда
+        // предмет застрянет неподтверждённым навсегда.
+        let waiting = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "pendingMine": true}),
+            Some(users[1]),
+        )
+        .expect("список ожидающих подтверждения");
+        let rows = waiting["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "ровно один предмет ждёт подтверждения");
+        assert_eq!(rows[0]["id"].as_i64(), Some(item));
+        assert_eq!(waiting["total"].as_i64(), Some(1), "счётчик не должен врать");
+
+        // У остальных этот же отбор пуст: чужое подтверждение — не их дело.
+        let others = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "pendingMine": true}),
+            Some(users[2]),
+        )
+        .expect("чужой список");
+        assert_eq!(others["rows"].as_array().unwrap().len(), 0);
+
+        // Обычный каталог этот предмет по-прежнему показывает всем: он не
+        // спрятан, он просто не выдаётся.
+        let catalog = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws}),
+            Some(users[2]),
+        )
+        .expect("обычный каталог");
+        assert!(
+            catalog["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"].as_i64() == Some(item)),
+            "ожидающий подтверждения предмет остаётся в каталоге"
+        );
+
         // Чужой подтвердить не может.
         let stranger = dispatch(
             &mut conn,
@@ -2603,6 +2646,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(groups, 3, "две свои плюс одна чужая");
+
+        // Список групп обязан нести права по каждой отдельно. Интерфейс
+        // берёт их именно отсюда; когда их не было, он рисовал кнопки по
+        // правам из профиля — и рядовой работник видел «Списать всё»,
+        // получая отказ при нажатии.
+        let list = dispatch(&mut conn, "meta.workspaces", &json!({}), Some(hero)).unwrap();
+        let rows = list.as_array().expect("список групп");
+        assert_eq!(rows.len(), 3, "видны все три группы героя");
+        let find = |ws: i64| {
+            rows.iter()
+                .find(|r| r["id"].as_i64() == Some(ws))
+                .unwrap_or_else(|| panic!("группа {ws} не в списке"))
+        };
+        assert_eq!(
+            find(own)["rights"]["manageUsers"].as_bool(),
+            Some(true),
+            "в своей группе права владельца"
+        );
+        assert_eq!(
+            find(foreign)["rights"]["manageUsers"].as_bool(),
+            Some(false),
+            "в чужой группе тот же аккаунт — наблюдатель"
+        );
+        assert_eq!(
+            find(foreign)["rights"]["writeOff"].as_bool(),
+            Some(false),
+            "наблюдателю нельзя списывать — кнопки быть не должно"
+        );
         cleanup(conn, path);
     }
 

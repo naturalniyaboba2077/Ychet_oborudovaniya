@@ -1,5 +1,5 @@
-import { useRef, useState } from 'react'
-import type { FormEvent, KeyboardEvent } from 'react'
+import { useState } from 'react'
+import type { FormEvent } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
@@ -203,84 +203,6 @@ function SubmitButton({
   )
 }
 
-/* ── OTP: 6 ячеек 40×48, mono 20px, автофокус, авто-переход, вставка целиком ── */
-function OtpInput({ onComplete }: { onComplete: (code: string) => void }) {
-  const [digits, setDigits] = useState<string[]>(Array(6).fill(''))
-  const refs = useRef<(HTMLInputElement | null)[]>([])
-
-  const update = (next: string[], focusIdx: number) => {
-    setDigits(next)
-    refs.current[focusIdx]?.focus()
-    if (next.every((d) => d !== '')) onComplete(next.join(''))
-  }
-
-  const handleChange = (i: number, raw: string) => {
-    const d = raw.replace(/\D/g, '')
-    if (!d) return
-    if (d.length > 1) {
-      // вставка кода целиком
-      const next = Array(6).fill('')
-      for (let k = 0; k < 6; k++) next[k] = d[k] ?? ''
-      update(next, Math.min(d.length, 5))
-      return
-    }
-    const next = [...digits]
-    next[i] = d
-    update(next, Math.min(i + 1, 5))
-  }
-
-  const handleKeyDown = (i: number, e: KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Backspace') {
-      e.preventDefault()
-      const next = [...digits]
-      if (next[i]) {
-        next[i] = ''
-        update(next, i)
-      } else if (i > 0) {
-        next[i - 1] = ''
-        update(next, i - 1)
-      }
-    }
-    if (e.key === 'ArrowLeft' && i > 0) refs.current[i - 1]?.focus()
-    if (e.key === 'ArrowRight' && i < 5) refs.current[i + 1]?.focus()
-  }
-
-  const handlePaste = (e: React.ClipboardEvent<HTMLInputElement>) => {
-    e.preventDefault()
-    const d = e.clipboardData.getData('text').replace(/\D/g, '').slice(0, 6)
-    if (!d) return
-    const next = Array(6).fill('')
-    for (let k = 0; k < 6; k++) next[k] = d[k] ?? ''
-    update(next, Math.min(d.length, 5))
-  }
-
-  return (
-    <div className="flex justify-between gap-2">
-      {digits.map((d, i) => (
-        <input
-          key={i}
-          ref={(el) => {
-            refs.current[i] = el
-          }}
-          value={d}
-          autoFocus={i === 0}
-          inputMode="numeric"
-          maxLength={6}
-          onChange={(e) => handleChange(i, e.target.value)}
-          onKeyDown={(e) => handleKeyDown(i, e)}
-          onPaste={handlePaste}
-          aria-label={`Цифра ${i + 1} из 6`}
-          className={cn(
-            'h-12 w-10 rounded-xl border border-brand-100 bg-surface text-center font-mono text-xl',
-            'text-ink-900 focus:border-brand-600 focus:ring-[3px] focus:ring-[#5E629B22]',
-          )}
-        />
-      ))}
-    </div>
-  )
-}
-
-/* ── Индикатор надёжности пароля: полоса 4px, красный→жёлтый→зелёный ── */
 function PasswordStrength({ password }: { password: string }) {
   if (!password) return null
   let score = 0
@@ -404,16 +326,14 @@ function LoginTab() {
   // повторного обращения к серверу не будет.
   const googleEnabled =
     trpc.auth.options.useQuery(undefined, { retry: 0 }).data?.googleEnabled === true
-  const [mode, setMode] = useState<'password' | 'sms'>('password')
   const [phone, setPhone] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [remember, setRemember] = useState(true)
   const [state, setState] = useState<SubmitState>('idle')
-  const [smsState, setSmsState] = useState<SubmitState>('idle')
-  const [codeSent, setCodeSent] = useState(false)
   const [errors, setErrors] = useState<{ phone?: string; password?: string }>({})
   const [shakeTick, setShakeTick] = useState(0)
+  const [forgotOpen, setForgotOpen] = useState(false)
 
   const digits = phoneDigits(phone)
   const phoneComplete = digits.length === 11
@@ -454,24 +374,6 @@ function LoginTab() {
     void finish(undefined, phone)
   }
 
-  const requestCode = () => {
-    if (!phoneComplete) {
-      setErrors({ phone: 'Введите телефон полностью' })
-      setShakeTick((t) => t + 1)
-      return
-    }
-    setErrors({})
-    setSmsState('loading')
-    window.setTimeout(() => {
-      setSmsState('idle')
-      setCodeSent(true)
-    }, 700)
-  }
-
-  const submitCode = (code: string) => {
-    if (code.length !== 6) return
-    void finish(undefined, phone)
-  }
 
   const onPhoneChange = (raw: string) => {
     setPhone(formatPhone(phoneDigits(raw)))
@@ -483,7 +385,7 @@ function LoginTab() {
       onSubmit={submitPassword}
       noValidate
       className="space-y-4"
-      key={`login-${mode}-${shakeTick}`}
+      key={`login-${shakeTick}`}
     >
       <Field
         index={0}
@@ -508,86 +410,84 @@ function LoginTab() {
         </div>
       </Field>
 
-      {mode === 'password' ? (
-        <>
-          <Field index={1} label="Пароль" error={errors.password} shake={!!errors.password}>
-            <div className="relative">
-              <Lock
-                size={18}
-                className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-ink-300"
-              />
-              <input
-                type={showPassword ? 'text' : 'password'}
-                value={password}
-                onChange={(e) => {
-                  setPassword(e.target.value)
-                  if (errors.password) setErrors((p) => ({ ...p, password: undefined }))
-                }}
-                placeholder="Ваш пароль"
-                autoComplete="current-password"
-                className={cn(inputClass(!!errors.password), 'pr-11')}
-              />
-              <EyeToggle shown={showPassword} onToggle={() => setShowPassword((v) => !v)} />
-            </div>
-          </Field>
+        <Field index={1} label="Пароль" error={errors.password} shake={!!errors.password}>
+          <div className="relative">
+            <Lock
+              size={18}
+              className="pointer-events-none absolute left-4 top-1/2 -translate-y-1/2 text-ink-300"
+            />
+            <input
+              type={showPassword ? 'text' : 'password'}
+              value={password}
+              onChange={(e) => {
+                setPassword(e.target.value)
+                if (errors.password) setErrors((p) => ({ ...p, password: undefined }))
+              }}
+              placeholder="Ваш пароль"
+              autoComplete="current-password"
+              className={cn(inputClass(!!errors.password), 'pr-11')}
+            />
+            <EyeToggle shown={showPassword} onToggle={() => setShowPassword((v) => !v)} />
+          </div>
+        </Field>
 
-          <motion.div
-            variants={fieldVariants}
-            initial="hidden"
-            animate="show"
-            custom={2}
-            className="flex items-center justify-between"
+        <motion.div
+          variants={fieldVariants}
+          initial="hidden"
+          animate="show"
+          custom={2}
+          className="flex items-center justify-between"
+        >
+          <Checkbox checked={remember} onChange={setRemember} label="Запомнить меня" />
+          <button
+            type="button"
+            onClick={() => setForgotOpen(true)}
+            className="rounded-md px-1 text-[13px] font-semibold text-brand-600 transition-colors hover:bg-brand-50"
           >
-            <Checkbox checked={remember} onChange={setRemember} label="Запомнить меня" />
-            <button
-              type="button"
-              onClick={() => toast.message('Ссылка для сброса отправлена по SMS')}
-              className="rounded-md px-1 text-[13px] font-semibold text-brand-600 transition-colors hover:bg-brand-50"
-            >
-              Забыли пароль?
-            </button>
-          </motion.div>
+            Забыли пароль?
+          </button>
+        </motion.div>
 
-          <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={3}>
-            <SubmitButton state={state}>Войти</SubmitButton>
-          </motion.div>
-        </>
-      ) : (
-        <>
-          {codeSent ? (
-            <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={1}>
-              <p className="mb-2 text-[13px] leading-[18px] text-ink-500">
-                Код отправлен на <span className="font-mono-num">{phone}</span>
-              </p>
-              <OtpInput onComplete={submitCode} />
+        <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={3}>
+          <SubmitButton state={state}>Войти</SubmitButton>
+        </motion.div>
+
+      {/* Восстановление пароля. Раньше кнопка обещала ссылку по SMS —
+          рассылки нет и не было, так что человек ждал сообщения впустую.
+          Работающий способ ровно один: пароль сбрасывает руководитель
+          организации, и сказать надо именно это. */}
+      {forgotOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-ink-900/40 px-4"
+          onClick={() => setForgotOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md rounded-card bg-surface p-5 shadow-modal"
+          >
+            <h3 className="text-lg font-bold text-ink-900">Забыли пароль</h3>
+            <p className="mt-2 text-sm leading-5 text-ink-500">
+              Рассылки по SMS у приложения нет, поэтому сбросить пароль самому нельзя.
+              Попросите руководителя вашей организации — он задаст новый в разделе
+              «Сотрудники», и все прежние входы при этом закроются.
+            </p>
+            <p className="mt-2 text-sm leading-5 text-ink-500">
+              Если к учётной записи привязан Google, войдите через него — пароль не
+              понадобится.
+            </p>
+            <div className="mt-5 flex justify-end">
               <button
                 type="button"
-                onClick={() => setCodeSent(false)}
-                className="mt-3 text-[13px] font-semibold text-brand-600 transition-colors hover:text-brand-700"
+                onClick={() => setForgotOpen(false)}
+                className="h-10 rounded-xl bg-accent px-4 text-sm font-semibold text-white hover:bg-accent-hover"
               >
-                Отправить код повторно
+                Понятно
               </button>
-            </motion.div>
-          ) : (
-            <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={1}>
-              <motion.button
-                type="button"
-                onClick={requestCode}
-                whileTap={{ scale: 0.97 }}
-                className="flex h-12 w-full items-center justify-center gap-2 rounded-xl bg-accent text-sm font-semibold text-white transition-all hover:-translate-y-px hover:bg-accent-hover"
-              >
-                {smsState === 'loading' ? (
-                  <Loader2 size={18} className="animate-spin" />
-                ) : (
-                  'Получить код'
-                )}
-              </motion.button>
-            </motion.div>
-          )}
-          {state === 'success' && (
-            <p className="text-center text-sm font-semibold text-success">Код принят</p>
-          )}
-        </>
+            </div>
+          </div>
+        </div>
       )}
 
       <motion.div
@@ -606,24 +506,6 @@ function LoginTab() {
         <GoogleButton enabled={googleEnabled} />
       </motion.div>
 
-      <motion.div variants={fieldVariants} initial="hidden" animate="show" custom={5}>
-        <motion.button
-          type="button"
-          onClick={() => {
-            if (mode === 'password') {
-              toast.message('Вход по SMS пока не настроен')
-              return
-            }
-            setMode('password')
-            setErrors({})
-            setCodeSent(false)
-          }}
-          whileTap={{ scale: 0.97 }}
-          className="flex h-12 w-full items-center justify-center rounded-xl border border-brand-100 bg-surface text-sm font-semibold text-ink-900 transition-colors hover:bg-brand-50"
-        >
-          {mode === 'password' ? 'Войти по коду из SMS' : 'Войти по паролю'}
-        </motion.button>
-      </motion.div>
 
       <motion.div
         variants={fieldVariants}
