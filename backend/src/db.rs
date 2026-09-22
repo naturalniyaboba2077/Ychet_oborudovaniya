@@ -94,6 +94,21 @@ fn migrate(conn: &Connection) -> Result<()> {
     // ТЗ §5: у вложения есть уменьшенная копия и контрольная сумма.
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN thumb_url TEXT", []);
     let _ = conn.execute("ALTER TABLE item_photos ADD COLUMN sha256 TEXT", []);
+    // Область сверки и запрет передач на её время. Раньше интерфейс
+    // предлагал и то и другое, но сверка всегда охватывала всё
+    // пространство, а галочка «блокировать передачи» ничего не делала.
+    let _ = conn.execute(
+        "ALTER TABLE inventory_sessions ADD COLUMN building_site_id INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE inventory_sessions ADD COLUMN storage_id INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "ALTER TABLE inventory_sessions ADD COLUMN block_transfers INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     // ТЗ §8: группа может требовать фото-подтверждение при списании.
     let _ = conn.execute(
         "ALTER TABLE workspaces ADD COLUMN require_writeoff_photo INTEGER NOT NULL DEFAULT 0",

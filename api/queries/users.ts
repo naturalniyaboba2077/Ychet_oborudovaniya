@@ -112,10 +112,19 @@ export async function inviteUser(data: {
   return findUserById(id);
 }
 
+/**
+ * Организации человека вместе с его правами в каждой.
+ *
+ * Права идут рядом с организацией, а не отдельно: в одном аккаунте роли
+ * разные, и профиль должен называть ту, что есть здесь.
+ */
 export async function workspacesOfUser(userId: number) {
   const links = await getDb().query.userWorkspaces.findMany({
     where: eq(userWorkspaces.userId, userId),
     with: { workspace: true },
   });
-  return links.map((l) => l.workspace);
+  return links.map((l) => ({
+    ...l.workspace,
+    rights: (l.rightsJson ? (JSON.parse(l.rightsJson) as RoleRights) : null) as RoleRights | null,
+  }));
 }

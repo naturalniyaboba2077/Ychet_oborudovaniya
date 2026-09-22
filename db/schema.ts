@@ -75,6 +75,10 @@ export const userWorkspaces = sqliteTable(
     id: integer("id").primaryKey({ autoIncrement: true }),
     userId: integer("user_id").notNull(),
     workspaceId: integer("workspace_id").notNull(),
+    // Права именно в этой организации. В одном аккаунте человек бывает
+    // руководителем своей бригады и рядовым в чужой, поэтому права живут
+    // на связке, а не на пользователе.
+    rightsJson: text("rights_json"),
   },
   (t) => [index("uw_user_idx").on(t.userId), index("uw_ws_idx").on(t.workspaceId)],
 );
@@ -259,6 +263,12 @@ export const inventorySessions = sqliteTable("inventory_sessions", {
   startedBy: integer("started_by").notNull(),
   createdAt: ts("created_at"),
   completedAt: tsNull("completed_at"),
+  // Область сверки: склад, объект или всё пространство, если оба пусты.
+  storageId: integer("storage_id"),
+  buildingSiteId: integer("building_site_id"),
+  // Пока идёт пересчёт, предметы области не выдаются и не передаются —
+  // иначе ведомость не сойдётся, и виноватым окажется тот, кто считал.
+  blockTransfers: integer("block_transfers", { mode: "boolean" }).notNull().default(false),
 });
 
 export const inventoryResults = sqliteTable(

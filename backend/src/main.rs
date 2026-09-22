@@ -394,12 +394,30 @@ async fn serve_attachment(
     let Ok(bytes) = std::fs::read(&path) else {
         return (StatusCode::NOT_FOUND, "нет такого файла").into_response();
     };
-    let mime = match ext {
-        "png" => "image/png",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "pdf" => "application/pdf",
-        _ => "image/jpeg",
+    // Снимки показываем прямо на странице, всё остальное отдаём файлом.
+    // Содержимое пришло от людей: показать его в нашем же источнике —
+    // значит позволить чужому PDF или HTML выполниться как своему.
+    let (mime, inline) = match ext {
+        "png" => ("image/png", true),
+        "webp" => ("image/webp", true),
+        "gif" => ("image/gif", true),
+        "jpg" | "jpeg" => ("image/jpeg", true),
+        "pdf" => ("application/pdf", false),
+        "doc" => ("application/msword", false),
+        "docx" => (
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            false,
+        ),
+        "xls" => ("application/vnd.ms-excel", false),
+        "xlsx" => (
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            false,
+        ),
+        "txt" => ("text/plain; charset=utf-8", false),
+        "csv" => ("text/csv; charset=utf-8", false),
+        "zip" => ("application/zip", false),
+        "rtf" => ("application/rtf", false),
+        _ => ("application/octet-stream", false),
     };
     axum::http::Response::builder()
         .status(StatusCode::OK)
@@ -408,6 +426,10 @@ async fn serve_attachment(
         // одно и то же. Кэш приватный: ответ зависит от сессии.
         .header("cache-control", "private, max-age=31536000, immutable")
         .header("x-content-type-options", "nosniff")
+        .header(
+            "content-disposition",
+            if inline { "inline" } else { "attachment" },
+        )
         .body(axum::body::Body::from(bytes))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

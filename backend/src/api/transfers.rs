@@ -126,7 +126,42 @@ pub(crate) fn ensure_item_circulates(
             "По предмету есть неисправность, выдача запрещена",
         ));
     }
+    ensure_not_under_inventory(conn, item)?;
     Ok(())
+}
+
+/// Запрещает движение предметов, которые сейчас пересчитывают.
+///
+/// Галочка «блокировать передачи» в окне инвентаризации раньше ничего не
+/// делала — под ней прямо было написано, что в демо-версии блокировка не
+/// применяется. Смысл же у неё простой: пока идёт пересчёт, вещи не должны
+/// разъезжаться, иначе ведомость не сойдётся и виноватым окажется тот, кто
+/// считал.
+///
+/// Область берём из самой сверки: весь склад, один объект или всё
+/// пространство — как выбрал начавший.
+fn ensure_not_under_inventory(conn: &Connection, item: &Value) -> Result<(), ApiError> {
+    let ws = item["workspaceId"].as_i64().unwrap_or(0);
+    let storage = item["storageId"].as_i64();
+    let site = item["buildingSiteId"].as_i64();
+    let blocking: Option<String> = conn
+        .query_row(
+            "SELECT number FROM inventory_sessions
+             WHERE workspace_id=?1 AND status='in_progress' AND block_transfers=1
+               AND (storage_id IS NULL OR storage_id=?2)
+               AND (building_site_id IS NULL OR building_site_id=?3)
+             LIMIT 1",
+            params![ws, storage, site],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+    match blocking {
+        Some(number) => Err(ApiError::conflict(format!(
+            "Идёт инвентаризация {number}: передачи закрыты до её завершения"
+        ))),
+        None => Ok(()),
+    }
 }
 
 pub(crate) fn take_one(

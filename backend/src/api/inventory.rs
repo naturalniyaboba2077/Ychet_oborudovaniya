@@ -29,6 +29,9 @@ pub(crate) fn inv_sessions(conn: &Connection, input: &Value) -> ApiResult {
                 "id": id, "number": r.get::<_, String>(1)?, "workspaceId": r.get::<_, i64>(2)?,
                 "status": r.get::<_, String>(3)?, "startedBy": r.get::<_, i64>(4)?,
                 "createdAt": r.get::<_, String>(5)?, "completedAt": r.get::<_, Option<String>>(6)?,
+                "storageId": r.get::<_, Option<i64>>(7)?,
+                "buildingSiteId": r.get::<_, Option<i64>>(8)?,
+                "blockTransfers": r.get::<_, i64>(9)? != 0,
                 "totalItems": total, "checkedItems": checked,
                 "starter": jsn::user_public(conn, r.get(4)?),
             }))
@@ -40,7 +43,9 @@ pub(crate) fn inv_sessions(conn: &Connection, input: &Value) -> ApiResult {
 
 pub(crate) fn inv_session_full(conn: &Connection, id: i64) -> Option<Value> {
     conn.query_row(
-        "SELECT id, number, workspace_id, status, started_by, created_at, completed_at FROM inventory_sessions WHERE id=?1",
+        "SELECT id, number, workspace_id, status, started_by, created_at, completed_at,
+                storage_id, building_site_id, block_transfers
+         FROM inventory_sessions WHERE id=?1",
         params![id],
         |r| {
             let mut results = Vec::new();
@@ -58,6 +63,12 @@ pub(crate) fn inv_session_full(conn: &Connection, id: i64) -> Option<Value> {
                 "id": r.get::<_, i64>(0)?, "number": r.get::<_, String>(1)?, "workspaceId": r.get::<_, i64>(2)?,
                 "status": r.get::<_, String>(3)?, "startedBy": r.get::<_, i64>(4)?,
                 "createdAt": r.get::<_, String>(5)?, "completedAt": r.get::<_, Option<String>>(6)?,
+                // Область сверки и замок на передачи: интерфейс должен
+                // показывать, что именно пересчитывают и почему не даёт
+                // выдать инструмент.
+                "storageId": r.get::<_, Option<i64>>(7)?,
+                "buildingSiteId": r.get::<_, Option<i64>>(8)?,
+                "blockTransfers": r.get::<_, i64>(9)? != 0,
                 "starter": jsn::user_public(conn, r.get(4)?),
                 "results": results
             }))
@@ -100,16 +111,38 @@ pub(crate) fn inv_create(conn: &Connection, input: &Value, user_id: Option<i64>)
         |r| r.get(0),
     )?;
     let number = format!("ИНВ-{:03}", n + 1);
-    conn.execute("INSERT INTO inventory_sessions (number, workspace_id, started_by, created_at) VALUES (?1,?2,?3,?4)", params![number, ws, uid, now()])?;
+    let storage = i64v(input, "storageId");
+    let site = i64v(input, "buildingSiteId");
+    let block = b(input, "blockTransfers").unwrap_or(false);
+    conn.execute(
+        "INSERT INTO inventory_sessions
+            (number, workspace_id, started_by, created_at, storage_id, building_site_id, block_transfers)
+         VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![number, ws, uid, now(), storage, site, block as i64],
+    )?;
     let sid = conn.last_insert_rowid();
-    let mut sql =
-        String::from("SELECT id, quantity, quantitative FROM items WHERE workspace_id=?1");
-    if let Some(st) = i64v(input, "storageId") {
-        sql.push_str(&format!(" AND storage_id={st}"));
+
+    // Область сверки. Раньше её принимали только по складу, а выбор объекта
+    // в интерфейсе молча означал «всё пространство» — человек пересчитывал
+    // один объект, а в ведомости числился весь склад.
+    // Списанное в сверку не берём: пересчитывать то, чего уже нет, незачем.
+    let mut sql = String::from(
+        "SELECT id, quantity, quantitative FROM items
+         WHERE workspace_id=?1 AND written_off_at IS NULL",
+    );
+    let mut args: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ws)];
+    if let Some(st) = storage {
+        args.push(Box::new(st));
+        sql.push_str(&format!(" AND storage_id=?{}", args.len()));
     }
+    if let Some(site) = site {
+        args.push(Box::new(site));
+        sql.push_str(&format!(" AND building_site_id=?{}", args.len()));
+    }
+    let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<(i64, Option<f64>, i64)> = stmt
-        .query_map(params![ws], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .query_map(refs.as_slice(), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .filter_map(|x| x.ok())
         .collect();
     for (id, qty, qnt) in rows {

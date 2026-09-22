@@ -27,7 +27,8 @@ import {
 import { QRCodeSVG } from 'qrcode.react'
 import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
-import { preparePhoto } from '@/lib/photo'
+import { preparePhoto, readAsDataUrl } from '@/lib/photo'
+import { MAX_ATTACHMENT_BYTES } from '@/lib/attachments'
 import type { PreparedPhoto } from '@/lib/photo'
 
 // ─── Схема формы ─────────────────────────────────────────────────────────────
@@ -342,8 +343,10 @@ export default function CreateTool() {
   const titleFileRef = useRef<HTMLInputElement>(null)
   const extraFileRef = useRef<HTMLInputElement>(null)
 
-  // Документы (локальный список имён — загрузка файлов в демо недоступна)
-  const [docs, setDocs] = useState<{ name: string; size: number }[]>([])
+  // Документы. Держим и содержимое: карточки ещё нет, приложить файл
+  // некуда, поэтому он ждёт здесь и уезжает сразу после создания.
+  const [docs, setDocs] = useState<{ name: string; size: number; dataUrl: string }[]>([])
+  const [docError, setDocError] = useState<string | null>(null)
   const docFileRef = useRef<HTMLInputElement>(null)
 
   // Автоподсказки брендов при вводе наименования
@@ -354,6 +357,30 @@ export default function CreateTool() {
   }, [title, brands])
 
   const create = trpc.items.create.useMutation()
+  const addDocument = trpc.items.addDocument.useMutation()
+
+  /**
+   * Отправляет приложенные документы к только что созданной карточке.
+   *
+   * Отдельным шагом после создания: до создания предмета нет, и приложить
+   * файл не к чему. Неудачу не прячем — карточка уже создана, и человек
+   * должен знать, что паспорт к ней не приложился.
+   */
+  const uploadDocs = async (itemId: number): Promise<string | null> => {
+    const failed: string[] = []
+    for (const doc of docs) {
+      try {
+        await addDocument.mutateAsync({ itemId, name: doc.name, url: doc.dataUrl })
+      } catch (e) {
+        failed.push(doc.name)
+        console.error('документ не приложился', doc.name, e)
+      }
+    }
+    if (failed.length === 0) return null
+    return failed.length === docs.length
+      ? 'Карточка создана, но документы не приложились'
+      : `Карточка создана; не приложились: ${failed.join(', ')}`
+  }
 
   // Справочники можно пополнять прямо из формы. Право у каждого своё:
   // категории и бренды — manageDictionaries, склады и объекты — свои.
@@ -431,6 +458,11 @@ export default function CreateTool() {
         onSuccess: (item) => {
           utils.items.list.invalidate()
           utils.items.nextInternalId.invalidate()
+          if (item && docs.length > 0) {
+            void uploadDocs(item.id).then((problem) => {
+              if (problem) setToast(problem)
+            })
+          }
           if (andMore) {
             reset()
             setTitlePhoto(null)
@@ -1014,8 +1046,26 @@ export default function CreateTool() {
                   className="hidden"
                   onChange={(e) => {
                     const files = Array.from(e.target.files ?? [])
-                    if (files.length) setDocs((p) => [...p, ...files.map((f) => ({ name: f.name, size: f.size }))])
                     e.target.value = ''
+                    void (async () => {
+                      for (const file of files) {
+                        // Отказ сразу, на выборе: узнать о том, что файл
+                        // велик, после заполнения всей формы — обидно.
+                        if (file.size > MAX_ATTACHMENT_BYTES) {
+                          setDocError(
+                            `«${file.name}» больше ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} МБ — не приложится`,
+                          )
+                          continue
+                        }
+                        try {
+                          const dataUrl = await readAsDataUrl(file)
+                          setDocError(null)
+                          setDocs((p) => [...p, { name: file.name, size: file.size, dataUrl }])
+                        } catch {
+                          setDocError(`Не удалось прочитать «${file.name}»`)
+                        }
+                      }
+                    })()
                   }}
                 />
                 {docs.length > 0 && (
@@ -1042,9 +1092,14 @@ export default function CreateTool() {
                     ))}
                   </ul>
                 )}
-                <p className="mt-1.5 text-xs text-ink-300">
-                  В демо-версии файлы прикрепляются к карточке через панель управления
-                </p>
+                {docError ? (
+                  <p className="mt-1.5 text-xs font-semibold text-danger">{docError}</p>
+                ) : (
+                  <p className="mt-1.5 text-xs text-ink-300">
+                    Паспорт, счёт, акт поверки. До {MAX_ATTACHMENT_BYTES / (1024 * 1024)} МБ на файл —
+                    приложатся к карточке сразу после создания
+                  </p>
+                )}
               </div>
               <div>
                 <FieldLabel>Комментарий</FieldLabel>

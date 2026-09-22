@@ -670,7 +670,19 @@ pub(crate) fn store_data_url(raw: &str) -> Option<String> {
         "image/webp" => "webp",
         "image/gif" => "gif",
         "application/pdf" => "pdf",
-        _ => "jpg",
+        // Документы к карточке: паспорт инструмента, счёт, акт поверки.
+        // Неизвестный тип складываем как «bin» — отдаём его вложением, а не
+        // показываем: содержимое пришло от человека, доверять ему нельзя.
+        "application/msword" => "doc",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+        "application/vnd.ms-excel" => "xls",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+        "text/plain" => "txt",
+        "text/csv" => "csv",
+        "application/zip" => "zip",
+        "application/rtf" | "text/rtf" => "rtf",
+        "image/jpeg" | "image/jpg" | "" => "jpg",
+        _ => "bin",
     };
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(payload.as_bytes())
@@ -744,6 +756,96 @@ pub(crate) fn items_add_photo(conn: &Connection, input: &Value, user_id: Option<
         "sha256": photo_checksum(&url),
         "isTitle": is_title
     }))
+}
+
+/// Прикрепляет документ к карточке: паспорт, счёт, акт поверки.
+///
+/// Раньше форма создания собирала имена файлов и выбрасывала их: под
+/// списком стояла подпись «в демо-версии файлы прикрепляются через панель
+/// управления», а панели такой не было. Человек прикладывал паспорт
+/// инструмента и был уверен, что тот сохранился.
+pub(crate) fn items_add_document(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let item_id = i64v(input, "itemId").ok_or_else(|| ApiError::bad("itemId"))?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
+
+    let raw = s(input, "url").ok_or_else(|| ApiError::bad("url"))?;
+    let name = s(input, "name")
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| ApiError::bad("Укажите название документа"))?;
+    if name.chars().count() > 200 {
+        return Err(ApiError::bad("Слишком длинное название документа"));
+    }
+    // Отказ должен быть внятным: чаще всего это просто слишком большой файл,
+    // и молчаливое «не сохранилось» тут хуже всего.
+    let stored = store_data_url(&raw).ok_or_else(|| {
+        ApiError::bad(format!(
+            "Файл не сохранён: допускается не больше {} МБ",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        ))
+    })?;
+    conn.execute(
+        "INSERT INTO item_documents (item_id, name, url) VALUES (?1,?2,?3)",
+        params![item_id, name, stored],
+    )?;
+    let id = conn.last_insert_rowid();
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "update",
+        None,
+        None,
+        None,
+        Some(&format!("Добавлен документ: {name}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    Ok(json!({"id": id, "itemId": item_id, "name": name, "url": stored}))
+}
+
+/// Убирает документ из карточки.
+///
+/// Сам файл на диске остаётся: имя у него — сумма содержимого, и тот же
+/// файл может быть приложен к другой карточке. Чистка диска — отдельная
+/// задача, и делать её мимоходом при удалении строки нельзя.
+pub(crate) fn items_remove_document(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let (item_id, name): (i64, String) = conn
+        .query_row(
+            "SELECT item_id, name FROM item_documents WHERE id=?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| ApiError::bad("Документ не найден"))?;
+    let ws = require_item_access(conn, uid, item_id)?;
+    require_can_in_workspace(conn, uid, ws, "editItems")?;
+    conn.execute("DELETE FROM item_documents WHERE id=?1", params![id])?;
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(item_id),
+        "update",
+        None,
+        None,
+        None,
+        Some(&format!("Удалён документ: {name}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    Ok(json!({"id": id, "itemId": item_id}))
 }
 
 pub(crate) fn items_add_comment(

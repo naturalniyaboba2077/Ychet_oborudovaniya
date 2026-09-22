@@ -32,7 +32,7 @@ export const profileRouter = createRouter({
       return updateUser(me.id, input);
     }),
 
-  /** Заглушка: смена пароля (демо-режим, реальной авторизации нет). */
+  // Пароль меняет Rust-узел: здесь только форма вызова и типы.
   changePassword: publicQuery
     .input(
       z.object({
@@ -40,5 +40,25 @@ export const profileRouter = createRouter({
         newPassword: z.string().min(10),
       }),
     )
-    .mutation(async () => ({ ok: true, message: "Пароль изменён (демо-режим)" })),
+    .mutation(async () => ({ ok: true, message: "Пароль изменён" })),
+
+  /**
+   * Выход из организации. Инструмент, который числился за человеком,
+   * возвращается на склад; последнего руководителя сервер не выпускает.
+   */
+  leaveWorkspace: publicQuery
+    .input(z.object({ workspaceId: z.number().int().positive() }))
+    .mutation(async ({ input }) => ({
+      ok: true,
+      workspaceId: input.workspaceId,
+      releasedItems: 0,
+    })),
+
+  /**
+   * Удаление собственного аккаунта: подтверждается паролем. Строка
+   * пользователя остаётся обезличенной — на неё ссылается журнал выдач.
+   */
+  deleteAccount: publicQuery
+    .input(z.object({ password: z.string().min(1) }))
+    .mutation(async () => ({ ok: true, message: "Аккаунт удалён" })),
 });

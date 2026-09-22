@@ -42,13 +42,24 @@ export const inventoryRouter = createRouter({
     .input(
       z.object({
         workspaceId: z.number().int().positive().optional(),
+        // Область сверки: склад, объект или всё пространство, если ни то
+        // ни другое не задано.
         storageId: z.number().int().positive().optional(),
+        buildingSiteId: z.number().int().positive().optional(),
+        // Пока идёт пересчёт, предметы области не выдаются и не передаются.
+        blockTransfers: z.boolean().optional(),
       }),
     )
     .mutation(async ({ ctx, input }) => {
       const me = await requireMe(ctx);
       const workspaceId = input.workspaceId ?? (await getDefaultWorkspaceId());
-      return createInventorySession({ workspaceId, startedBy: me.id, storageId: input.storageId });
+      return createInventorySession({
+        workspaceId,
+        startedBy: me.id,
+        storageId: input.storageId,
+        buildingSiteId: input.buildingSiteId,
+        blockTransfers: input.blockTransfers ?? false,
+      });
     }),
 
   checkItem: publicQuery

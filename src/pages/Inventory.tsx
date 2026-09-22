@@ -18,6 +18,7 @@ import { format } from 'date-fns'
 import type { inferRouterOutputs } from '@trpc/server'
 import type { AppRouter } from '../../api/router'
 import { trpc } from '@/providers/trpc'
+import { buildXlsx, type CellValue } from '@/lib/xlsx'
 import { cn } from '@/lib/utils'
 
 type RouterOutputs = inferRouterOutputs<AppRouter>
@@ -62,6 +63,13 @@ function rowKind(r: QtyLike): RowKind {
   const act = r.actualQty ?? exp
   if (act === exp) return 'matched'
   return act > exp ? 'surplus' : 'shortage'
+}
+
+/** Дата для бумажного акта: его подписывают, и «2026-09-22T10:03:11Z» там ни к чему. */
+function actDate(raw: string | Date | null | undefined): string {
+  if (!raw) return '—'
+  const d = raw instanceof Date ? raw : new Date(raw)
+  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString('ru-RU')
 }
 
 const KIND_BADGE: Record<RowKind, { label: string; bg: string; color: string }> = {
@@ -350,11 +358,15 @@ function CreateSessionModal({
   const utils = trpc.useUtils()
   const [scope, setScope] = useState<ScopeKey>('all')
   const [storageId, setStorageId] = useState<number | null>(null)
+  const [buildingSiteId, setBuildingSiteId] = useState<number | null>(null)
   const [blockTransfers, setBlockTransfers] = useState(false)
 
   const meQ = trpc.meta.currentUser.useQuery(undefined, { enabled: open })
   const storagesQ = trpc.admin.storages.list.useQuery(undefined, {
     enabled: open && scope === 'storage',
+  })
+  const sitesQ = trpc.admin.buildingSites.list.useQuery(undefined, {
+    enabled: open && scope === 'site',
   })
 
   const create = trpc.inventory.create.useMutation({
@@ -379,8 +391,13 @@ function CreateSessionModal({
   }, [open, onClose])
 
   const submit = () => {
-    if (scope === 'storage' && storageId) create.mutate({ storageId })
-    else create.mutate({})
+    // Область уезжает на сервер целиком: он по ней собирает ведомость и он
+    // же держит замок на передачи.
+    create.mutate({
+      storageId: scope === 'storage' ? (storageId ?? undefined) : undefined,
+      buildingSiteId: scope === 'site' ? (buildingSiteId ?? undefined) : undefined,
+      blockTransfers,
+    })
   }
 
   return (
@@ -484,10 +501,26 @@ function CreateSessionModal({
                 )}
 
                 {scope === 'site' && (
-                  <div className="mt-2 flex items-start gap-2 rounded-xl bg-info-bg border-l-[3px] border-teal px-3 py-2.5 text-sm text-ink-900">
-                    <ClipboardCheck size={16} className="mt-0.5 shrink-0 text-teal-dark" />
-                    В демо-версии сверка по объекту охватывает все позиции пространства.
-                  </div>
+                  <motion.div
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    className="mt-2 overflow-hidden"
+                  >
+                    <select
+                      value={buildingSiteId ?? ''}
+                      onChange={(e) => setBuildingSiteId(e.target.value ? Number(e.target.value) : null)}
+                      className="h-11 w-full rounded-xl border border-brand-100 bg-surface px-4 text-sm text-ink-900 outline-none focus:border-brand-600 focus:ring-[3px] focus:ring-brand-600/15"
+                    >
+                      <option value="" disabled>
+                        {sitesQ.isLoading ? 'Загрузка объектов…' : 'Выберите объект'}
+                      </option>
+                      {(sitesQ.data ?? []).map((st) => (
+                        <option key={st.id} value={st.id}>
+                          {st.name}
+                        </option>
+                      ))}
+                    </select>
+                  </motion.div>
                 )}
               </div>
 
@@ -522,7 +555,7 @@ function CreateSessionModal({
                   Блокировать передачи в области сверки до завершения
                   {blockTransfers && (
                     <span className="block text-xs text-ink-300">
-                      В демо-версии блокировка не применяется
+                      Пока идёт пересчёт, эти инструменты нельзя будет взять и передать
                     </span>
                   )}
                 </span>
@@ -540,7 +573,11 @@ function CreateSessionModal({
               <button
                 type="button"
                 onClick={submit}
-                disabled={create.isPending || (scope === 'storage' && !storageId)}
+                disabled={
+                  create.isPending ||
+                  (scope === 'storage' && !storageId) ||
+                  (scope === 'site' && !buildingSiteId)
+                }
                 className="inline-flex h-10 items-center gap-2 rounded-xl bg-accent px-5 text-sm font-semibold text-white transition-all hover:bg-accent-hover active:scale-[0.97] disabled:opacity-50"
               >
                 {create.isPending && <Loader2 size={16} className="animate-spin" />}
@@ -579,6 +616,7 @@ function SessionView({
   const inProgress = session?.status === 'in_progress'
 
   const stats = useMemo(() => computeStats(session?.results ?? []), [session])
+
 
   const sortedResults = useMemo(() => {
     const results = [...(session?.results ?? [])]
@@ -620,6 +658,54 @@ function SessionView({
     },
     [sitesQ.data, storagesQ.data]
   )
+
+  /**
+   * Выгружает акт сверки книгой Excel.
+   *
+   * Раньше кнопка показывала «Акт сформирован (PDF, демо)» и ничего не
+   * создавала. Акт нужен бумажный: его подписывают и подшивают, поэтому
+   * отдавать надо файл, а не надпись. Excel, а не PDF, — тем же писателем,
+   * что и остальные отчёты, и его потом можно править.
+   */
+  const downloadAct = useCallback(() => {
+    if (!session) return
+    const rows: CellValue[][] = [
+      [`Акт инвентаризации ${session.number}`],
+      ['Начата', actDate(session.createdAt)],
+      ['Завершена', session.completedAt ? actDate(session.completedAt) : '—'],
+      ['Ответственный', session.starter?.fullName ?? '—'],
+      [],
+      ['Вн. номер', 'Наименование', 'Место', 'Ожидалось', 'Фактически', 'Расхождение', 'Итог'],
+      ...sortedResults.map((r): CellValue[] => {
+        const expected = r.expectedQty ?? 0
+        const actual = r.checked ? (r.actualQty ?? expected) : null
+        return [
+          r.item?.internalId ?? '',
+          r.item?.title ?? '',
+          placeLabel(r.item),
+          expected,
+          actual,
+          actual === null ? '' : actual - expected,
+          KIND_BADGE[rowKind(r)].label,
+        ]
+      }),
+      [],
+      ['Всего позиций', sortedResults.length],
+      ['Совпало', stats.matched],
+      ['Недостача', stats.shortage],
+      ['Излишек', stats.surplus],
+      ['Не проверено', stats.pending],
+    ]
+    const url = URL.createObjectURL(buildXlsx(rows, `Акт ${session.number}`))
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `Акт инвентаризации ${session.number}.xlsx`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    showToast(`Акт ${session.number} сохранён`)
+  }, [session, sortedResults, stats, placeLabel, showToast])
 
   const doCheck = (r: ResultRow, qty?: number) => {
     checkItem.mutate(
@@ -766,7 +852,7 @@ function SessionView({
               ) : (
                 <button
                   type="button"
-                  onClick={() => showToast(`Акт инвентаризации ${session.number} сформирован (PDF, демо)`)}
+                  onClick={downloadAct}
                   className="inline-flex h-10 items-center gap-2 rounded-xl border border-brand-100 bg-surface px-5 text-sm font-semibold text-ink-900 transition-colors hover:bg-brand-50"
                 >
                   <FileDown size={16} />
@@ -911,7 +997,7 @@ function SessionView({
         stats={stats}
         onAct={() => {
           setSummaryOpen(false)
-          showToast(`Акт инвентаризации ${session.number} сформирован (PDF, демо)`)
+          downloadAct()
         }}
         onBack={() => {
           setSummaryOpen(false)

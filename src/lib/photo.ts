@@ -52,7 +52,7 @@ async function loadImage(file: File): Promise<{ source: CanvasImageSource; width
   }
 }
 
-function readAsDataUrl(file: File): Promise<string> {
+export function readAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => resolve(String(reader.result))

@@ -230,6 +230,27 @@ export const itemsRouter = createRouter({
     )
     .mutation(({ input }) => addItemPhoto(input.itemId, input.url, input.isTitle)),
 
+  // Документы к карточке: паспорт, счёт, акт поверки. Файл приезжает
+  // data-URL и уходит на диск — в базе остаётся только ссылка.
+  addDocument: publicQuery
+    .input(
+      z.object({
+        itemId: z.number().int().positive(),
+        name: z.string().min(1).max(200),
+        url: z.string().min(1),
+      }),
+    )
+    .mutation(async ({ input }) => ({
+      id: 0,
+      itemId: input.itemId,
+      name: input.name,
+      url: "",
+    })),
+
+  removeDocument: publicQuery
+    .input(z.object({ id: z.number().int().positive() }))
+    .mutation(async ({ input }) => ({ id: input.id, itemId: 0 })),
+
   addComment: publicQuery
     .input(
       z.object({

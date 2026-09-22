@@ -32,6 +32,8 @@ export async function createInventorySession(data: {
   workspaceId: number;
   startedBy: number;
   storageId?: number;
+  buildingSiteId?: number;
+  blockTransfers?: boolean;
 }) {
   const db = getDb();
   const countRows = await db
@@ -42,13 +44,21 @@ export async function createInventorySession(data: {
 
   const [row] = await db
     .insert(inventorySessions)
-    .values({ number, workspaceId: data.workspaceId, startedBy: data.startedBy })
+    .values({
+      number,
+      workspaceId: data.workspaceId,
+      startedBy: data.startedBy,
+      storageId: data.storageId ?? null,
+      buildingSiteId: data.buildingSiteId ?? null,
+      blockTransfers: data.blockTransfers ?? false,
+    })
     .returning({ id: inventorySessions.id });
   const id = row!.id;
 
   // Заполняем ожидаемые позиции текущим остатком (по складу, если указан).
   const conds = [eq(items.workspaceId, data.workspaceId)];
   if (data.storageId) conds.push(eq(items.storageId, data.storageId));
+  if (data.buildingSiteId) conds.push(eq(items.buildingSiteId, data.buildingSiteId));
   const stock = await db
     .select({ id: items.id, quantity: items.quantity, quantitative: items.quantitative })
     .from(items)

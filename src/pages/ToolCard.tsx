@@ -46,7 +46,8 @@ import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
 import { askStatusReason, itemCirculates, statusNeedsReason } from '@/lib/status-reason'
 import { parseDueInput, toDateTimeLocal } from '@/lib/due-date'
-import { preparePhoto } from '@/lib/photo'
+import { preparePhoto, readAsDataUrl } from '@/lib/photo'
+import { MAX_ATTACHMENT_BYTES } from '@/lib/attachments'
 import { useStore } from '@/lib/store'
 
 // ─── Утилиты ─────────────────────────────────────────────────────────────────
@@ -1626,6 +1627,52 @@ function CommentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) =
 
 function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) => void }) {
   const docs = item.documents ?? []
+  const utils = trpc.useUtils()
+  const fileRef = useRef<HTMLInputElement>(null)
+  const [busy, setBusy] = useState(false)
+  const add = trpc.items.addDocument.useMutation()
+  const remove = trpc.items.removeDocument.useMutation()
+
+  const upload = async (files: File[]) => {
+    setBusy(true)
+    const failed: string[] = []
+    for (const file of files) {
+      // Предел тот же, что у сервера: узнать об отказе до чтения файла
+      // быстрее, чем после загрузки восьми мегабайт по мобильной связи.
+      if (file.size > MAX_ATTACHMENT_BYTES) {
+        failed.push(`${file.name} (больше ${MAX_ATTACHMENT_BYTES / (1024 * 1024)} МБ)`)
+        continue
+      }
+      try {
+        const url = await readAsDataUrl(file)
+        await add.mutateAsync({ itemId: item.id, name: file.name, url })
+      } catch (e) {
+        failed.push(file.name)
+        console.error('документ не приложился', file.name, e)
+      }
+    }
+    await utils.items.byId.invalidate({ id: item.id })
+    setBusy(false)
+    onDone(
+      failed.length === 0
+        ? files.length === 1
+          ? 'Документ приложен'
+          : `Приложено документов: ${files.length}`
+        : `Не приложились: ${failed.join(', ')}`,
+    )
+  }
+
+  const drop = async (id: number, name: string) => {
+    if (!window.confirm(`Убрать «${name}» из карточки?`)) return
+    try {
+      await remove.mutateAsync({ id })
+      await utils.items.byId.invalidate({ id: item.id })
+      onDone('Документ убран')
+    } catch (e) {
+      onDone(e instanceof Error ? e.message : 'Не удалось убрать документ')
+    }
+  }
+
   return (
     <div className="space-y-4">
       {docs.length > 0 ? (
@@ -1643,13 +1690,21 @@ function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) 
                 </span>
                 <div className="min-w-0 flex-1">
                   <div className="text-sm font-semibold text-ink-900 truncate">{d.name}</div>
-                  <a
-                    href={d.url}
-                    download={d.name}
-                    className="text-[13px] font-semibold text-brand-600 hover:text-brand-700"
-                  >
-                    Скачать
-                  </a>
+                  <div className="flex items-center gap-3">
+                    <a
+                      href={d.url}
+                      download={d.name}
+                      className="text-[13px] font-semibold text-brand-600 hover:text-brand-700"
+                    >
+                      Скачать
+                    </a>
+                    <button
+                      onClick={() => void drop(d.id, d.name)}
+                      className="text-[13px] font-semibold text-ink-300 transition-colors hover:text-danger"
+                    >
+                      Убрать
+                    </button>
+                  </div>
                 </div>
               </div>
             )
@@ -1658,12 +1713,24 @@ function DocumentsTab({ item, onDone }: { item: ItemFull; onDone: (msg: string) 
       ) : (
         <p className="text-sm text-ink-500 py-4 text-center">Документов пока нет.</p>
       )}
+      <input
+        ref={fileRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          const files = Array.from(e.target.files ?? [])
+          e.target.value = ''
+          if (files.length) void upload(files)
+        }}
+      />
       <button
-        onClick={() => onDone('В демо-версии документы добавляются через панель управления')}
-        className="w-full rounded-xl border border-dashed border-brand-100 px-4 py-6 text-sm font-semibold text-ink-500 hover:bg-brand-50 transition-colors flex items-center justify-center gap-2"
+        onClick={() => fileRef.current?.click()}
+        disabled={busy}
+        className="w-full rounded-xl border border-dashed border-brand-100 px-4 py-6 text-sm font-semibold text-ink-500 hover:bg-brand-50 transition-colors flex items-center justify-center gap-2 disabled:opacity-60"
       >
-        <Upload size={16} strokeWidth={1.75} />
-        Загрузить документ
+        {busy ? <Loader2 size={16} className="animate-spin" /> : <Upload size={16} strokeWidth={1.75} />}
+        {busy ? 'Загружаем…' : 'Загрузить документ'}
       </button>
     </div>
   )

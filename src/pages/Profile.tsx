@@ -18,6 +18,7 @@ import { format } from 'date-fns'
 import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
+import type { Rights } from '@/lib/rights'
 // mock-данные только как запасной экран, если API ещё не ответил
 import type { inferRouterOutputs } from '@trpc/server'
 import type { AppRouter } from '../../api/router'
@@ -32,6 +33,7 @@ interface VWorkspace {
   name: string
   prefix: string
   timezone: string
+  rights: Rights | null
 }
 
 interface VProfile {
@@ -55,15 +57,27 @@ function adaptProfile(p: ApiProfile): VProfile {
       name: w.name,
       prefix: w.internalIdPrefix,
       timezone: w.timezone,
+      rights: (w.rights ?? null) as Rights | null,
     })),
   }
 }
 
-/** Демо-мета для известных пространств (design.md §12) */
-function workspaceMeta(name: string, isFirst: boolean): { role: string; units: number | null } {
-  if (name.includes('СтройМонтаж')) return { role: 'Владелец', units: 142 }
-  if (name.includes('РемСервис')) return { role: 'Кладовщик', units: 38 }
-  return { role: isFirst ? 'Владелец' : 'Участник', units: null }
+/**
+ * Как назвать роль человека в организации.
+ *
+ * Раньше это выводилось из названия: «СтройМонтаж» значило «Владелец», а
+ * рядом приписывалось «142 ед.» — число, взятое из воздуха. Человек видел
+ * чужую роль и выдуманный остаток. Теперь роль читается из настоящих прав,
+ * а придуманных чисел нет вовсе.
+ */
+function workspaceRole(rights: Rights | null | undefined): string {
+  if (!rights) return 'Участник'
+  if (rights.manageUsers && rights.manageWorkspaces) return 'Владелец'
+  if (rights.manageUsers) return 'Руководитель'
+  if (rights.writeOff || rights.replenish || rights.inventory) return 'Кладовщик'
+  if (rights.createItems || rights.editItems) return 'Мастер'
+  if (rights.transferItems) return 'Работник'
+  return 'Наблюдатель'
 }
 
 // ─── Утилиты ─────────────────────────────────────────────────────────────────
@@ -298,17 +312,17 @@ export default function Profile() {
     [profileQ.data],
   )
 
-  // Локальные дополнения (создание пространства без бэкенда, скрытые пространства)
-  const [extraWs, setExtraWs] = useState<VWorkspace[]>([])
+  // Покинутые прячем сразу, не дожидаясь ответа списка: сервер уже знает,
+  // а перерисовка экрана идёт следом.
   const [leftWsIds, setLeftWsIds] = useState<Set<string>>(new Set())
   const [avatarOverride, setAvatarOverride] = useState<string | null>(null)
 
   const allWorkspaces: VWorkspace[] = useMemo(() => {
     const base = profile?.workspaces ?? []
     const merged = [...base]
-    for (const e of extraWs) if (!merged.some((w) => w.name === e.name)) merged.push(e)
+
     return merged.filter((w) => !leftWsIds.has(w.id))
-  }, [profile, extraWs, leftWsIds])
+  }, [profile, leftWsIds])
 
   // ─── Мутации ───────────────────────────────────────────────────────────────
 
@@ -331,6 +345,16 @@ export default function Profile() {
   })
 
   const pwdM = trpc.profile.changePassword.useMutation()
+
+  const leaveWsM = trpc.profile.leaveWorkspace.useMutation({
+    onSuccess: () => {
+      utils.profile.get.invalidate()
+      utils.meta.workspaces.invalidate()
+      utils.items.list.invalidate()
+    },
+  })
+
+  const deleteAccountM = trpc.profile.deleteAccount.useMutation()
 
   const createWsM = trpc.admin.workspaces.create.useMutation({
     onSuccess: () => {
@@ -391,7 +415,12 @@ export default function Profile() {
         { avatarUrl: dataUrl },
         {
           onSuccess: () => showToast('Фото обновлено'),
-          onError: () => showToast('Фото сохранено локально (демо)'),
+          // Показывать «сохранено», когда сервер отказал, нельзя: человек
+          // уходит уверенным, что фото на месте, а его там нет.
+          onError: (e) => {
+            setAvatarOverride(null)
+            showToast(e.message || 'Не удалось сохранить фото', true)
+          },
         }
       )
     } catch {
@@ -408,7 +437,7 @@ export default function Profile() {
       { fullName: fullName.trim(), position: position.trim() || null },
       {
         onSuccess: () => showToast('Данные обновлены'),
-        onError: () => showToast('Данные обновлены локально (демо)'),
+        onError: (e) => showToast(e.message || 'Не удалось сохранить данные', true),
       }
     )
     setFlash(true)
@@ -468,10 +497,9 @@ export default function Profile() {
         onSuccess: () => {
           showToast('Рабочее пространство создано')
         },
-        onError: () => {
-          setExtraWs((prev) => [...prev, { id: `local-${Date.now()}`, name, prefix: wsPrefix.trim() || 'ВН-', timezone: wsTz }])
-          showToast('Пространство создано локально (демо)')
-        },
+        // Раньше на отказ сервера в список подставлялась выдуманная
+        // запись: организация была видна, но не существовала.
+        onError: (e) => showToast(e.message || 'Не удалось создать пространство', true),
       }
     )
     setCreateWsOpen(false)
@@ -481,19 +509,50 @@ export default function Profile() {
 
   const onLeaveWorkspace = () => {
     if (!leaveWs || leaveConfirm.trim() !== leaveWs.name) return
-    setLeftWsIds((prev) => new Set(prev).add(leaveWs.id))
-    showToast(`Вы покинули ${leaveWs.name}`)
-    setLeaveWs(null)
-    setLeaveConfirm('')
+    const id = Number(leaveWs.id)
+    if (!Number.isFinite(id)) return
+    const name = leaveWs.name
+    leaveWsM.mutate(
+      { workspaceId: id },
+      {
+        onSuccess: (res) => {
+          setLeftWsIds((prev) => new Set(prev).add(leaveWs.id))
+          showToast(
+            res.releasedItems > 0
+              ? `Вы покинули ${name}; инструмент (${res.releasedItems}) вернулся на склад`
+              : `Вы покинули ${name}`,
+          )
+          setLeaveWs(null)
+          setLeaveConfirm('')
+        },
+        // Сервер отказывает по делу — например, если это последний
+        // руководитель. Прятать такой отказ нельзя.
+        onError: (e) => showToast(e.message || 'Не удалось выйти', true),
+      },
+    )
   }
 
   const onDeleteAccount = () => {
     if (!deleteAgree || !deletePwd) return
-    setDeleteOpen(false)
-    setDeleteAgree(false)
-    setDeletePwd('')
-    showToast('Аккаунт удалён (демо)', true)
-    setTimeout(() => navigate('/login'), 600)
+    deleteAccountM.mutate(
+      { password: deletePwd },
+      {
+        onSuccess: () => {
+          setDeleteOpen(false)
+          setDeleteAgree(false)
+          setDeletePwd('')
+          showToast('Аккаунт удалён')
+          setTimeout(() => window.location.assign('/login'), 600)
+        },
+        // Неверный пароль, последняя организация без руководителя — всё
+        // это причины, по которым удаление не состоялось, и человек
+        // должен их увидеть, а не оказаться на экране входа.
+        onError: (e) => {
+          setDeletePwd('')
+          showToast(e.message || 'Не удалось удалить аккаунт', true)
+        },
+      },
+    )
   }
 
   // ─── Render ────────────────────────────────────────────────────────────────
@@ -785,9 +844,9 @@ export default function Profile() {
             <h3 className="text-[17px] leading-6 font-semibold text-ink-900 mb-4">Рабочие пространства</h3>
             <div className="space-y-2.5">
               <AnimatePresence initial={false}>
-                {allWorkspaces.map((ws, i) => {
+                {allWorkspaces.map((ws) => {
                   const isCurrent = ws.name === workspace?.name
-                  const meta = workspaceMeta(ws.name, i === 0)
+                  const role = workspaceRole(ws.rights)
                   return (
                     <motion.div
                       key={ws.id}
@@ -805,8 +864,7 @@ export default function Profile() {
                       <span className="min-w-0 flex-1">
                         <span className="block text-[15px] font-semibold text-ink-900 truncate">{ws.name}</span>
                         <span className="block text-xs text-ink-500">
-                          {meta.role}
-                          {meta.units !== null ? ` · ${meta.units} ед.` : ''}
+                          {role}
                         </span>
                       </span>
                       <AnimatePresence>

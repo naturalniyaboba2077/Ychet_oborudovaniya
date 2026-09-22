@@ -497,6 +497,8 @@ fn required_right(procedure: &str) -> Option<&'static str> {
         procedure,
         "items.update"
             | "items.addPhoto"
+            | "items.addDocument"
+            | "items.removeDocument"
             | "history.move"
             | "items.resolveFault"
             | "items.decideChange"
@@ -752,6 +754,8 @@ fn dispatch_inner(
         "items.restore" => items_restore(conn, input, user_id),
         "items.confirmResponsibility" => items_confirm_responsibility(conn, input, user_id),
         "items.addPhoto" => items_add_photo(conn, input, user_id),
+        "items.addDocument" => items_add_document(conn, input, user_id),
+        "items.removeDocument" => items_remove_document(conn, input, user_id),
         "items.addComment" => items_add_comment(conn, input, user_id),
         "items.reportFault" => report_fault(conn, input, user_id),
         "items.faults" => list_faults(conn, input),
@@ -845,6 +849,8 @@ fn dispatch_inner(
         "profile.get" => profile_get(conn, user_id),
         "profile.update" => profile_update(conn, input, user_id),
         "profile.changePassword" => profile_password(conn, input, user_id),
+        "profile.leaveWorkspace" => profile_leave_workspace(conn, input, user_id),
+        "profile.deleteAccount" => profile_delete_account(conn, input, user_id),
         "admin.users.list" => admin_users(conn, input),
         "admin.users.create" => admin_user_create(conn, input),
         "admin.users.update" => admin_user_update(conn, input, user_id),
@@ -2522,6 +2528,322 @@ mod tests {
         .expect("подтверждение назначенным");
         assert_eq!(confirmed["responsibleUserId"].as_i64(), Some(users[1]));
         assert_eq!(confirmed["pendingResponsibleId"].as_i64(), None);
+        cleanup(conn, path);
+    }
+
+    /// Выход из организации и удаление аккаунта.
+    ///
+    /// Обе кнопки в профиле раньше только меняли картинку на экране:
+    /// «Вы покинули …» и «Аккаунт удалён (демо)» — а при следующем входе
+    /// всё оказывалось на месте.
+    #[test]
+    fn leaving_and_deleting_actually_happen() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-leave-{}.db", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+
+        let boss = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Бригадир", "phone": "+79990000011", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let ws = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Бригада"}),
+            Some(boss),
+        )
+        .unwrap()["workspaceId"]
+            .as_i64()
+            .unwrap();
+        let invite = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "worker", "maxUses": 5}),
+            Some(boss),
+        )
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let hand = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Работник", "phone": "+79990000012", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        dispatch(&mut conn, "auth.join", &json!({"token": invite}), Some(hand)).unwrap();
+
+        // За работником числится инструмент — он обязан вернуться на склад.
+        let item = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Перфоратор", "responsibleUserId": hand}),
+            Some(boss),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "items.confirmResponsibility",
+            &json!({"id": item}),
+            Some(hand),
+        )
+        .unwrap();
+
+        // Единственного руководителя не выпускаем: группа осталась бы без
+        // управления, и починить это изнутри было бы уже нельзя.
+        assert!(
+            dispatch(
+                &mut conn,
+                "profile.leaveWorkspace",
+                &json!({"workspaceId": ws}),
+                Some(boss),
+            )
+            .is_err(),
+            "последний руководитель не может выйти"
+        );
+
+        dispatch(
+            &mut conn,
+            "profile.leaveWorkspace",
+            &json!({"workspaceId": ws}),
+            Some(hand),
+        )
+        .expect("работник выходит");
+
+        let left: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+                params![hand, ws],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(left, 0, "состав должен измениться на самом деле");
+        let card = dispatch(&mut conn, "items.byId", &json!({"id": item}), Some(boss)).unwrap();
+        assert_eq!(
+            card["responsibleUserId"].as_i64(),
+            None,
+            "инструмент не может числиться за тем, кого в группе нет"
+        );
+
+        // Удаление аккаунта: без пароля — отказ.
+        assert!(
+            dispatch(
+                &mut conn,
+                "profile.deleteAccount",
+                &json!({"password": "не тот пароль"}),
+                Some(hand),
+            )
+            .is_err(),
+            "удаление без верного пароля недопустимо"
+        );
+
+        dispatch(
+            &mut conn,
+            "profile.deleteAccount",
+            &json!({"password": "LongEnoughPass1"}),
+            Some(hand),
+        )
+        .expect("аккаунт удаляется");
+
+        // Войти прежним телефоном больше нельзя, а сам номер освободился —
+        // иначе человек не смог бы завести учётную запись заново.
+        assert!(
+            dispatch(
+                &mut conn,
+                "auth.login",
+                &json!({"phone": "+79990000012", "password": "LongEnoughPass1"}),
+                None,
+            )
+            .is_err(),
+            "удалённый аккаунт не должен пускать"
+        );
+        dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Работник снова", "phone": "+79990000012", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .expect("номер освободился");
+        cleanup(conn, path);
+    }
+
+    /// Инвентаризация: область сверки и запрет передач на её время.
+    ///
+    /// Раньше окно предлагало и то и другое, но выбор объекта молча
+    /// означал «всё пространство», а галочка блокировки не делала ничего —
+    /// так прямо и было написано под ней.
+    #[test]
+    fn inventory_covers_only_its_scope_and_can_freeze_transfers() {
+        let (mut conn, path, users, ws) = test_db();
+        let site = dispatch(
+            &mut conn,
+            "admin.buildingSites.create",
+            &json!({"workspaceId": ws, "name": "Объект на Ленина"}),
+            Some(users[0]),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let here = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Перфоратор", "buildingSiteId": site}),
+            Some(users[0]),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let elsewhere = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Болгарка"}),
+            Some(users[0]),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        let session = dispatch(
+            &mut conn,
+            "inventory.create",
+            &json!({"workspaceId": ws, "buildingSiteId": site, "blockTransfers": true}),
+            Some(users[0]),
+        )
+        .expect("сверка по объекту");
+        let results = session["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "в ведомость должен попасть только предмет с этого объекта"
+        );
+        assert_eq!(results[0]["itemId"].as_i64(), Some(here));
+        assert_eq!(session["blockTransfers"].as_bool(), Some(true));
+
+        // Пока идёт пересчёт, вещь с этого объекта не уезжает.
+        let blocked = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": here}),
+            Some(users[1]),
+        );
+        assert!(
+            blocked.is_err(),
+            "передача во время сверки этого объекта должна быть закрыта"
+        );
+
+        // А то, что вне области сверки, ходит как обычно: иначе один
+        // пересчёт останавливал бы работу всей бригады.
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": elsewhere}),
+            Some(users[1]),
+        )
+        .expect("вне области сверки выдача работает");
+
+        // После завершения замок снимается сам.
+        dispatch(
+            &mut conn,
+            "inventory.complete",
+            &json!({"sessionId": session["id"].as_i64().unwrap()}),
+            Some(users[0]),
+        )
+        .expect("сверка завершается");
+        dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": here}),
+            Some(users[1]),
+        )
+        .expect("после сверки выдача снова работает");
+        cleanup(conn, path);
+    }
+
+    /// Документы к карточке: паспорт инструмента, счёт, акт поверки.
+    ///
+    /// Форма создания раньше собирала имена файлов и выбрасывала их, а под
+    /// списком стояла подпись про «панель управления», которой не было.
+    #[test]
+    fn documents_attach_to_an_item_and_come_back_with_it() {
+        let (mut conn, path, users, ws) = test_db();
+        let item = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Перфоратор"}),
+            Some(users[0]),
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+
+        // Крошечный PDF: важно не содержимое, а то, что файл уезжает на
+        // диск и возвращается ссылкой, а не гигантской строкой в базе.
+        let added = dispatch(
+            &mut conn,
+            "items.addDocument",
+            &json!({
+                "itemId": item,
+                "name": "Паспорт инструмента.pdf",
+                "url": "data:application/pdf;base64,JVBERi0xLjQK",
+            }),
+            Some(users[0]),
+        )
+        .expect("документ прикрепляется");
+        let doc_id = added["id"].as_i64().unwrap();
+        let url = added["url"].as_str().unwrap().to_string();
+        assert!(
+            url.starts_with("/files/") && url.ends_with(".pdf"),
+            "документ должен лежать файлом на диске, а не строкой в базе: {url}"
+        );
+
+        let card = dispatch(&mut conn, "items.byId", &json!({"id": item}), Some(users[0])).unwrap();
+        let docs = card["documents"].as_array().expect("список документов");
+        assert_eq!(docs.len(), 1, "документ обязан вернуться вместе с карточкой");
+        assert_eq!(docs[0]["name"].as_str(), Some("Паспорт инструмента.pdf"));
+
+        // Без названия не принимаем: список из безымянных строк бесполезен.
+        assert!(
+            dispatch(
+                &mut conn,
+                "items.addDocument",
+                &json!({"itemId": item, "name": "  ", "url": "data:application/pdf;base64,JVBERi0xLjQK"}),
+                Some(users[0]),
+            )
+            .is_err(),
+            "документ без названия принимать нельзя"
+        );
+
+        // Мусор вместо файла — внятный отказ, а не молчаливая пустая строка.
+        assert!(
+            dispatch(
+                &mut conn,
+                "items.addDocument",
+                &json!({"itemId": item, "name": "Счёт", "url": "не файл"}),
+                Some(users[0]),
+            )
+            .is_err(),
+            "не-файл принимать нельзя"
+        );
+
+        dispatch(
+            &mut conn,
+            "items.removeDocument",
+            &json!({"id": doc_id}),
+            Some(users[0]),
+        )
+        .expect("документ убирается");
+        let after = dispatch(&mut conn, "items.byId", &json!({"id": item}), Some(users[0])).unwrap();
+        assert_eq!(after["documents"].as_array().unwrap().len(), 0);
         cleanup(conn, path);
     }
 
