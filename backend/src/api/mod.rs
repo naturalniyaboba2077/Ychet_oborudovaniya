@@ -2241,6 +2241,96 @@ mod tests {
         cleanup(conn, path);
     }
 
+    /// Вступление готовым аккаунтом даёт права из приглашения и подписывает
+    /// человека должностью. Раньше должность ставилась только при вступлении
+    /// с регистрацией, и в списках он значился без роли.
+    #[test]
+    fn joining_with_an_existing_account_grants_role_and_position() {
+        let path = std::env::temp_dir().join(format!("meshkeeper-join-{}", Uuid::new_v4()));
+        let mut conn = db::open(&path).expect("test database");
+
+        let host = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Хозяин", "phone": "+79990000001", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let ws = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Бригада"}),
+            Some(host),
+        )
+        .unwrap()["workspaceId"]
+            .as_i64()
+            .unwrap();
+        let token = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "member", "maxUses": 5}),
+            Some(host),
+        )
+        .unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let worker = dispatch(
+            &mut conn,
+            "auth.register",
+            &json!({"fullName": "Работяга", "phone": "+79990000002", "password": "LongEnoughPass1"}),
+            None,
+        )
+        .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        dispatch(
+            &mut conn,
+            "auth.join",
+            &json!({"token": token}),
+            Some(worker),
+        )
+        .expect("вступление готовым аккаунтом");
+
+        let position: Option<String> = conn
+            .query_row(
+                "SELECT position FROM users WHERE id=?1",
+                params![worker],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            position.as_deref(),
+            Some("Участник"),
+            "должность не проставлена"
+        );
+
+        let rights = merged_rights(&conn, worker, ws);
+        assert_eq!(
+            rights["createItems"].as_bool(),
+            Some(true),
+            "обычный участник ведёт учёт"
+        );
+        assert_eq!(
+            rights["manageUsers"].as_bool(),
+            Some(false),
+            "обычный участник не управляет людьми"
+        );
+
+        // Звать других он не должен.
+        let denied = dispatch(
+            &mut conn,
+            "admin.workspaces.createInvite",
+            &json!({"workspaceId": ws, "role": "owner"}),
+            Some(worker),
+        );
+        assert!(denied.is_err(), "участник не может выписывать приглашения");
+        cleanup(conn, path);
+    }
+
     /// Один аккаунт — несколько организаций, роли в них разные. Владелец
     /// своей группы может быть в чужой обычным работником, и права одной не
     /// должны протекать в другую.

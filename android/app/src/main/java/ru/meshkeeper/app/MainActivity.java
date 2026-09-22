@@ -116,6 +116,10 @@ public class MainActivity extends AppCompatActivity {
         }
         s.setUserAgentString(s.getUserAgentString() + " MeshKeeperAndroid");
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG);
+        CookieManager.getInstance().setAcceptCookie(true);
+        // Чужие cookie не принимаем: приложению нужен только свой сервер.
+        // Страницы входа Google работают на своих доменах и своих cookie,
+        // третьей стороной для нас не являются.
         CookieManager.getInstance().setAcceptThirdPartyCookies(web, false);
         web.setLayerType(View.LAYER_TYPE_HARDWARE, null);
         web.addJavascriptInterface(new JsBridge(), "MeshKeeperNative");
@@ -293,6 +297,15 @@ public class MainActivity extends AppCompatActivity {
         setup.setVisibility(View.GONE);
         web.setVisibility(View.VISIBLE);
         web.loadUrl(relay + "/login?app=1&mode=" + mode);
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Без этого cookie живут только в памяти: система убивает процесс, и
+        // сессия пропадает — приложение просит вход при каждом открытии,
+        // хотя человек никуда не выходил.
+        CookieManager.getInstance().flush();
     }
 
     @Override

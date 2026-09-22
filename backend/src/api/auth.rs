@@ -600,6 +600,14 @@ pub(crate) fn consume_invite(conn: &Connection, token: &str, user_id: i64) -> Ap
             "INSERT INTO user_workspaces (user_id, workspace_id, rights_json) VALUES (?1,?2,?3)",
             params![user_id, ws, db::rights_for_role(&invite.role).to_string()],
         )?;
+        // Должность подписывает человека в списках. Вступление существующим
+        // аккаунтом её не проставляло — в отличие от вступления с
+        // регистрацией, — и человек значился без роли. Уже заполненную не
+        // трогаем: её мог задать администратор.
+        conn.execute(
+            "UPDATE users SET position=?1 WHERE id=?2 AND (position IS NULL OR position='')",
+            params![invite_position(&invite.role), user_id],
+        )?;
     }
     conn.execute(
         "UPDATE invites SET used_count=used_count+1 WHERE id=?1",
