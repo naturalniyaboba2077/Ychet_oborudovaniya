@@ -1,3 +1,12 @@
+# Юнит центрального сервера MeshKeeper.
+#
+# Это копия того, что реально стоит на сервере. Файл в репозитории с ним
+# разошёлся — там был /opt/meshkeeper и порт 8080, а на машине давно
+# /root/meshkeeper и 8090, — и выкладка по старому файлу остановила бы
+# сервис: он не нашёл бы ни двоичного файла, ни базы.
+#
+# Ставится и переключается скриптом deploy/deploy.sh.
+
 [Unit]
 Description=MeshKeeper — учёт оборудования (центральный сервер)
 After=network-online.target
@@ -5,33 +14,34 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=meshkeeper
-Group=meshkeeper
-WorkingDirectory=/opt/meshkeeper
+User=root
+Group=root
+WorkingDirectory=/root/meshkeeper
 
-# Секреты держим в отдельном файле с правами 600, а не в юните.
-EnvironmentFile=/etc/meshkeeper/meshkeeper.env
-ExecStart=/opt/meshkeeper/meshkeeper-node
+# Секреты в отдельном файле с правами 600, а не в юните.
+EnvironmentFile=/root/meshkeeper/meshkeeper.env
+ExecStart=/root/meshkeeper/meshkeeper-node
 
 Restart=always
 RestartSec=3
 
-# Узел слушает только локальный порт; наружу его публикует nginx с TLS.
-Environment=MESHKEEPER_BIND=127.0.0.1:8080
-Environment=MESHKEEPER_DB=/var/lib/meshkeeper/meshkeeper.db
-Environment=MESHKEEPER_WEB_ROOT=/opt/meshkeeper/public
+# Узел слушает только локальный порт. 8080 на этой машине занят чужим
+# сервисом, поэтому 8090. Наружу публикует обратный прокси.
+Environment=MESHKEEPER_BIND=127.0.0.1:8090
+Environment=MESHKEEPER_DB=/root/meshkeeper/data/meshkeeper.db
+Environment=MESHKEEPER_WEB_ROOT=/root/meshkeeper/public
 Environment=MESHKEEPER_COOKIE_SECURE=1
 
-# Ограничения: сервису нужны только своя рабочая папка и каталог базы.
 NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=yes
+# ProtectHome снят намеренно: приложение лежит внутри /root, и с этой
+# защитой сервис не увидел бы собственные файлы.
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
-ReadWritePaths=/var/lib/meshkeeper
+ReadWritePaths=/root/meshkeeper
 RestrictAddressFamilies=AF_INET AF_INET6
 LockPersonality=yes
 MemoryDenyWriteExecute=yes

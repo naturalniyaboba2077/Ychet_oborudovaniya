@@ -9,9 +9,10 @@
 #   ./deploy/deploy.sh
 #
 # Перед первым запуском на сервере должны существовать:
-#   /opt/meshkeeper                 — каталог сервиса
-#   /var/lib/meshkeeper             — каталог базы
-#   /etc/meshkeeper/meshkeeper.env  — файл с MESHKEEPER_SYNC_TOKEN (chmod 600)
+#   $MESHKEEPER_DEPLOY_DIR              — каталог сервиса (по умолчанию /root/meshkeeper)
+#   $MESHKEEPER_DEPLOY_DIR/data         — каталог базы; выкладка его не трогает
+#   $MESHKEEPER_DEPLOY_DIR/meshkeeper.env — файл с секретами (chmod 600)
+#   /usr/local/sbin/meshkeeper-activate — скрипт переключения версии
 # См. deploy/README.md.
 
 set -euo pipefail
@@ -25,9 +26,13 @@ BINARY="$ROOT/dist/server/meshkeeper-node"
 PUBLIC="$ROOT/dist/public"
 
 # Адрес, который слушает узел. Наружу он не смотрит — его публикует обратный
-# прокси, — но порт приходится задавать: 8080 на машине может быть уже занят
-# чужим сервисом, и тогда MeshKeeper просто не поднимется.
-BIND="${MESHKEEPER_BIND:-127.0.0.1:8080}"
+# прокси, — но порт приходится задавать: на этой машине 8080 занят чужим
+# сервисом, поэтому по умолчанию 8090.
+BIND="${MESHKEEPER_BIND:-127.0.0.1:8090}"
+
+# Каталог сервиса. Машина общая: и порт, и путь задаются снаружи, потому
+# что значения по умолчанию на ней уже заняты чужим хозяйством.
+DIR="${MESHKEEPER_DEPLOY_DIR:-/root/meshkeeper}"
 
 if [[ ! -f "$BINARY" ]]; then
   echo "Нет $BINARY. Соберите Linux-бинарник:" >&2
@@ -40,15 +45,20 @@ if [[ ! -f "$PUBLIC/index.html" ]]; then
 fi
 
 echo "→ Проверяю доступ к $TARGET"
-ssh -o BatchMode=yes "$TARGET" 'test -d /opt/meshkeeper' || {
-  echo "Нет доступа по ключу или не создан /opt/meshkeeper. См. deploy/README.md" >&2
+ssh -n -o BatchMode=yes "$TARGET" "test -d '$DIR'" || {
+  echo "Нет доступа по ключу или не создан $DIR. См. deploy/README.md" >&2
   exit 1
 }
 
+# Копию базы снимаем до подмены двоичного файла, а не после: если новая
+# версия не поднимется, откатываться будет уже нечем.
+echo "→ Снимаю копию базы"
+ssh -n "$TARGET" "cd '$DIR' && sqlite3 data/meshkeeper.db \".backup '$DIR/backups/pre-deploy-\$(date +%Y%m%d-%H%M%S).db'\"" 
+
 echo "→ Загружаю новую версию во временный каталог"
-ssh "$TARGET" 'rm -rf /opt/meshkeeper/incoming && mkdir -p /opt/meshkeeper/incoming'
-scp -q "$BINARY" "$TARGET:/opt/meshkeeper/incoming/meshkeeper-node"
-scp -qr "$PUBLIC" "$TARGET:/opt/meshkeeper/incoming/public"
+ssh -n "$TARGET" "rm -rf '$DIR/incoming' && mkdir -p '$DIR/incoming'"
+scp -q "$BINARY" "$TARGET:$DIR/incoming/meshkeeper-node"
+scp -qr "$PUBLIC" "$TARGET:$DIR/incoming/public"
 # Юнит подставляем с нужным адресом, а не шлём как есть.
 UNIT="$(mktemp)"
 trap 'rm -f "$UNIT"' EXIT
@@ -57,15 +67,15 @@ grep -q "MESHKEEPER_BIND=$BIND" "$UNIT" || {
   echo "Не удалось подставить адрес $BIND в юнит" >&2
   exit 1
 }
-scp -q "$UNIT" "$TARGET:/opt/meshkeeper/incoming/meshkeeper.service"
+scp -q "$UNIT" "$TARGET:$DIR/incoming/meshkeeper.service"
 
 echo "→ Переключаю сервис"
 # Единственная команда, разрешённая деплой-пользователю через sudo. Она ставится
 # скриптом deploy/bootstrap.ps1 и делает переключение целиком, поэтому в sudoers
 # не нужны шаблоны с подстановками.
 # База не трогается: она живёт в /var/lib/meshkeeper и переживает выкладку.
-ssh "$TARGET" 'sudo /usr/local/sbin/meshkeeper-activate'
+ssh -n "$TARGET" 'sudo /usr/local/sbin/meshkeeper-activate'
 
 echo "→ Проверяю здоровье"
-ssh "$TARGET" 'curl -fsS http://127.0.0.1:8080/health' && echo
+ssh -n "$TARGET" "curl -fsS http://$BIND/health" && echo
 echo "Готово."
