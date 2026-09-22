@@ -1,3 +1,4 @@
+import { useRef } from 'react'
 import { useNavigate } from 'react-router'
 import { Building2, Phone, Warehouse } from 'lucide-react'
 import { motion } from 'framer-motion'
@@ -25,9 +26,55 @@ export default function ToolMiniCard({ tool, selectionMode = false, onCallClick 
     toggleToolSelected(tool.id)
   }
 
+  // Долгое нажатие включает выделение — привычный на телефоне жест, где
+  // маленькую галочку попасть трудно. Обычное нажатие по-прежнему открывает
+  // карточку: чтобы одно не срабатывало вместо другого, после долгого
+  // нажатия ближайший клик подавляется.
+  const holdTimer = useRef<number | null>(null)
+  const heldRef = useRef(false)
+
+  const startHold = () => {
+    heldRef.current = false
+    holdTimer.current = window.setTimeout(() => {
+      heldRef.current = true
+      if (!selectionMode) setSelectionMode(true)
+      toggleToolSelected(tool.id)
+      // Короткая отдача: человек должен понять, что жест принят.
+      try {
+        navigator.vibrate?.(30)
+      } catch {
+        /* вибрация есть не везде */
+      }
+    }, 450)
+  }
+
+  const cancelHold = () => {
+    if (holdTimer.current !== null) {
+      window.clearTimeout(holdTimer.current)
+      holdTimer.current = null
+    }
+  }
+
+  const onCardClick = () => {
+    if (heldRef.current) {
+      heldRef.current = false
+      return
+    }
+    if (selectionMode) {
+      toggleToolSelected(tool.id)
+      return
+    }
+    openCard()
+  }
+
   return (
     <motion.article
-      onClick={openCard}
+      onClick={onCardClick}
+      onPointerDown={startHold}
+      onPointerUp={cancelHold}
+      onPointerLeave={cancelHold}
+      onPointerCancel={cancelHold}
+      onContextMenu={(e) => e.preventDefault()}
       whileHover={{ y: -2 }}
       transition={{ duration: 0.2, ease: 'easeOut' }}
       className={cn(

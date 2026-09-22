@@ -160,7 +160,15 @@ pub(crate) fn history_write_off_atomic(
             )
             .optional()?
             .ok_or_else(|| ApiError::bad("В рабочем пространстве нет статуса списания"))?;
-        conn.execute("UPDATE items SET status_id=?1 WHERE id=?2", params![st, id])?;
+        // Отметка времени включает льготный срок: предмет гаснет в каталоге,
+        // но остаётся на виду, пока можно передумать. Ответственного снимаем:
+        // списанный предмет ни за кем не числится.
+        conn.execute(
+            "UPDATE items SET status_id=?1, written_off_at=?3, responsible_user_id=NULL,
+                              pending_responsible_id=NULL, due_at=NULL
+             WHERE id=?2",
+            params![st, id, now()],
+        )?;
         let entry = ledger::append(
             conn,
             ws,

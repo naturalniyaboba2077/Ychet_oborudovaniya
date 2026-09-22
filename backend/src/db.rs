@@ -119,6 +119,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL",
         [],
     );
+    // Списание с отсрочкой: предмет сначала гаснет в каталоге, и только
+    // через льготный срок уходит в архив. Отметка нужна, чтобы отличить
+    // «только что списали, ещё можно передумать» от «давно в архиве».
+    let _ = conn.execute("ALTER TABLE items ADD COLUMN written_off_at TEXT", []);
+    // Ответственный, который ещё не подтвердил, что берёт предмет на себя.
+    // Назначить можно кого угодно, но до подтверждения предмет не выдаётся:
+    // иначе человек узнавал бы о своей ответственности постфактум.
+    let _ = conn.execute(
+        "ALTER TABLE items ADD COLUMN pending_responsible_id INTEGER",
+        [],
+    );
+    let _ = conn.execute(
+        "CREATE INDEX IF NOT EXISTS items_written_off_idx ON items(written_off_at)",
+        [],
+    );
+
     // Индексы под запросы, которые выполняются на каждом экране. Без них
     // SQLite сканирует таблицу целиком: на списке истории это сотни полных
     // сканов подряд. Создаются отдельно от схемы, чтобы доехали и на базы,

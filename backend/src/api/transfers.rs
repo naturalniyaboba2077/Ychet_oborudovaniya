@@ -157,6 +157,17 @@ pub(crate) fn take_one_atomic(
     let item = jsn::item_json(conn, item_id, false)
         .ok_or_else(|| ApiError::not_found("Инструмент не найден"))?;
     ensure_item_circulates(conn, &item, item_id)?;
+    // Ответственный назначен, но ещё не подтвердил — предмет не выдаётся.
+    // Иначе он разошёлся бы по рукам, пока человек не знает, что отвечает
+    // за него.
+    if let Some(pending) = item["pendingResponsibleId"].as_i64() {
+        let who = jsn::user_public(conn, pending)
+            .and_then(|u| u["fullName"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "назначенный сотрудник".into());
+        return Err(ApiError::bad(format!(
+            "Выдача закрыта: {who} ещё не подтвердил, что отвечает за этот инструмент"
+        )));
+    }
     // Штучный предмет всегда у кого-то одного. Забрать его «через голову»
     // держателя нельзя: на этот случай в ТЗ есть передача с подтверждением,
     // иначе факт изъятия нигде не всплывёт.

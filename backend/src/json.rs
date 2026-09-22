@@ -128,7 +128,7 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
             "SELECT id, internal_id, title, category_id, brand_id, status_id, responsible_user_id,
                     building_site_id, storage_id, workspace_id, serial_number, cost, quantitative,
                     quantity, unit, comment, qr_code, notify_date, created_at, due_at,
-                    guid, calibrated_until, min_quantity
+                    guid, calibrated_until, min_quantity, written_off_at, pending_responsible_id
              FROM items WHERE id=?1",
             params![id],
             |r| {
@@ -160,6 +160,8 @@ pub fn item_json(conn: &Connection, id: i64, with_history: bool) -> Option<Value
                     "createdAt": r.get::<_, String>(18)?,
                     "dueAt": r.get::<_, Option<String>>(19)?,
                     "guid": r.get::<_, Option<String>>(20)?,
+                    "writtenOffAt": r.get::<_, Option<String>>(23)?,
+                    "pendingResponsibleId": r.get::<_, Option<i64>>(24)?,
                     "calibratedUntil": r.get::<_, Option<String>>(21)?,
                     "minQuantity": r.get::<_, Option<f64>>(22)?,
                     "category": named(conn, "categories", category_id),

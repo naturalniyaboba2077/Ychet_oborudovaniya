@@ -30,6 +30,9 @@ const listInput = z.object({
   statusId: z.number().int().positive().optional(),
   hasQr: z.boolean().optional(),
   onlyMine: z.boolean().optional(),
+  // Списанные предметы живут отдельным списком: в каталоге им не место,
+  // но и пропадать бесследно они не должны.
+  archived: z.boolean().optional(),
   page: z.number().int().min(1).default(1),
   limit: z.number().int().min(1).max(500).default(20),
   sort: z
@@ -191,6 +194,23 @@ export const itemsRouter = createRouter({
       }
       return item;
     }),
+
+  // Возврат списанного предмета в каталог. Списание не удаляет карточку:
+  // история выдач и ремонтов остаётся, иначе теряется смысл учёта.
+  restore: publicQuery
+    .input(z.object({ id: z.number().int().positive() }))
+    .mutation(async () => ({ id: 0 })),
+
+  // Человек подтверждает, что берёт предмет под свою ответственность.
+  // Назначить можно кого угодно, но до подтверждения предмет не выдаётся.
+  confirmResponsibility: publicQuery
+    .input(
+      z.object({
+        id: z.number().int().positive(),
+        accept: z.boolean().optional(),
+      }),
+    )
+    .mutation(async () => ({ id: 0 })),
 
   remove: publicQuery
     .input(z.object({ id: z.number().int().positive() }))

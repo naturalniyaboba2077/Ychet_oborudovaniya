@@ -69,10 +69,22 @@ pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>)
         .map(|q| q.trim().to_lowercase())
         .filter(|q| !q.is_empty());
     let only_mine = b(input, "onlyMine").unwrap_or(false);
+    // Архив показывается отдельным списком: в каталоге списанному предмету не
+    // место, но и пропадать бесследно он не должен.
+    let archived = b(input, "archived").unwrap_or(false);
 
     // Условия собираем один раз и используем и для счётчика, и для страницы,
     // чтобы «всего» и содержимое не могли разойтись.
+    let edge =
+        (chrono::Utc::now() - chrono::Duration::minutes(WRITE_OFF_GRACE_MINUTES)).to_rfc3339();
     let mut where_sql = String::from("workspace_id = ?1");
+    // Пока льготный срок не вышел, предмет остаётся в каталоге — погашенным,
+    // с обратным отсчётом. После — уходит в архив.
+    if archived {
+        where_sql.push_str(" AND written_off_at IS NOT NULL AND written_off_at <= :edge");
+    } else {
+        where_sql.push_str(" AND (written_off_at IS NULL OR written_off_at > :edge)");
+    }
     if only_mine {
         // user_id может отсутствовать: тогда «моих» предметов нет вовсе.
         where_sql.push_str(match user_id {
@@ -114,6 +126,12 @@ pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>)
         }
         None => where_sql,
     };
+    // Подставляем границу льготного срока тем же порядковым параметром.
+    let where_sql = {
+        let idx = args.len() + 1;
+        args.push(Box::new(edge));
+        where_sql.replace(":edge", &format!("?{idx}"))
+    };
     let refs: Vec<&dyn rusqlite::ToSql> = args.iter().map(|b| b.as_ref()).collect();
 
     let total: i64 = conn.query_row(
@@ -137,6 +155,144 @@ pub(crate) fn items_list(conn: &Connection, input: &Value, user_id: Option<i64>)
         .filter_map(|id| item_for_list(conn, id))
         .collect();
     Ok(json!({"rows": rows, "page": page, "limit": limit, "hasMore": has_more, "total": total}))
+}
+
+/// Зовёт человека подтвердить, что он берёт предмет под ответственность.
+fn notify_responsibility(conn: &Connection, uid: i64, item_id: i64, title: &str) {
+    let _ = conn.execute(
+        "INSERT INTO notifications (user_id, item_id, type, title, text, created_at)
+         VALUES (?1,?2,'system','Вас назначили ответственным',?3,?4)",
+        params![
+            uid,
+            item_id,
+            format!("«{title}» закрепят за вами, как только вы подтвердите"),
+            now()
+        ],
+    );
+}
+
+/// Возвращает списанный предмет обратно в каталог.
+///
+/// Списание не удаляет карточку: история выдач и ремонтов остаётся, иначе
+/// потерялся бы смысл учёта. Восстановление снимает отметку и возвращает
+/// предмет на склад — ответственного не назначает, его выберут заново.
+pub(crate) fn items_restore(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let ws = require_item_access(conn, uid, id)?;
+    // Возвращает тот же, кому позволено списывать: это одно решение,
+    // принимаемое дважды.
+    require_can_in_workspace(conn, uid, ws, "writeOff")?;
+
+    let written: Option<String> = conn
+        .query_row(
+            "SELECT written_off_at FROM items WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    if written.is_none() {
+        return Err(ApiError::bad("Этот предмет не списан"));
+    }
+
+    let in_stock: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='in-stock'",
+            params![ws],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    conn.execute(
+        "UPDATE items SET written_off_at=NULL, status_id=COALESCE(?1, status_id) WHERE id=?2",
+        params![in_stock, id],
+    )?;
+
+    let title: String = conn
+        .query_row("SELECT title FROM items WHERE id=?1", params![id], |r| {
+            r.get(0)
+        })
+        .unwrap_or_default();
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        "update",
+        None,
+        None,
+        None,
+        Some(&format!("Восстановлен из архива: {title}")),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
+}
+
+/// Человек подтверждает, что берёт предмет под свою ответственность.
+///
+/// Назначить ответственным можно кого угодно, но до подтверждения предмет
+/// не выдаётся: иначе человек узнавал бы о своей ответственности, когда
+/// спросят за пропажу. Назначивший сам себя подтверждает молча — соглашаться
+/// с собственным решением незачем.
+pub(crate) fn items_confirm_responsibility(
+    conn: &Connection,
+    input: &Value,
+    user_id: Option<i64>,
+) -> ApiResult {
+    let uid = require_user(conn, user_id)?;
+    let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    let ws = require_item_access(conn, uid, id)?;
+    let pending: Option<i64> = conn
+        .query_row(
+            "SELECT pending_responsible_id FROM items WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let Some(pending) = pending else {
+        return Err(ApiError::bad("Подтверждать нечего"));
+    };
+    if pending != uid {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Подтвердить может только тот, кого назначили",
+        ));
+    }
+    let accept = b(input, "accept").unwrap_or(true);
+    let name = jsn::user_public(conn, uid)
+        .and_then(|u| u["fullName"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    if accept {
+        conn.execute(
+            "UPDATE items SET responsible_user_id=?1, pending_responsible_id=NULL WHERE id=?2",
+            params![uid, id],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE items SET pending_responsible_id=NULL WHERE id=?1",
+            params![id],
+        )?;
+    }
+    ledger::append(
+        conn,
+        ws,
+        uid,
+        Some(id),
+        "update",
+        None,
+        Some(&name),
+        None,
+        Some(if accept {
+            "Ответственность подтверждена"
+        } else {
+            "Ответственность отклонена"
+        }),
+    )
+    .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    jsn::item_json(conn, id, false).ok_or_else(|| ApiError::bad("ошибка"))
 }
 
 pub(crate) fn items_by_id(conn: &Connection, input: &Value, user_id: Option<i64>) -> ApiResult {
@@ -216,7 +372,9 @@ pub(crate) fn items_create_atomic(
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
         params![
             internal, title, i64v(input,"categoryId"), i64v(input,"brandId"), i64v(input,"statusId"),
-            i64v(input,"responsibleUserId"), i64v(input,"buildingSiteId"), i64v(input,"storageId"), ws,
+            // Себя назначают сразу; чужого — только после подтверждения.
+            i64v(input,"responsibleUserId").filter(|r| *r == uid),
+            i64v(input,"buildingSiteId"), i64v(input,"storageId"), ws,
             s(input,"serialNumber"), f64v(input,"cost"), b(input,"quantitative").unwrap_or(false) as i64,
             f64v(input,"quantity"), s(input,"unit"), s(input,"comment"), qr, now()
         ],
@@ -250,11 +408,24 @@ pub(crate) fn items_create_atomic(
         Some("Инструмент добавлен в каталог"),
     )
     .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
+    // Назначили не себя — ответственность не наступает, пока человек её не
+    // подтвердит. Назначить можно кого угодно, но узнавать о ней постфактум,
+    // когда спросят за пропажу, он не должен.
+    if let Some(holder) = i64v(input, "responsibleUserId").filter(|r| *r != uid) {
+        require_member(conn, holder, ws)?;
+        conn.execute(
+            "UPDATE items SET pending_responsible_id=?1 WHERE id=?2",
+            params![holder, id],
+        )?;
+        let title = s(input, "title").unwrap_or_default();
+        notify_responsibility(conn, holder, id, &title);
+    }
+
     // Карточку можно завести сразу с ответственным. Это не проходит через
     // выдачу, поэтому без отдельной записи предмет числился бы за человеком,
     // а история об этом молчала — и разобрать потом, откуда он у него, было
     // бы нечем.
-    if let Some(holder) = i64v(input, "responsibleUserId") {
+    if let Some(holder) = i64v(input, "responsibleUserId").filter(|r| *r == uid) {
         let holder_name = jsn::user_public(conn, holder)
             .and_then(|u| u["fullName"].as_str().map(str::to_owned))
             .unwrap_or_else(|| format!("сотрудник #{holder}"));
@@ -416,6 +587,14 @@ pub(crate) fn items_remove(conn: &Connection, input: &Value, user_id: Option<i64
 pub(crate) fn photo_checksum(url: &str) -> String {
     hex::encode(Sha256::digest(url.as_bytes()))
 }
+
+/// Сколько списанный предмет ещё виден в каталоге, погашенным.
+///
+/// Списание — действие тяжёлое и часто ошибочное: не тот предмет в списке,
+/// промах по кнопке. Пятнадцать минут дают заметить и вернуть, не разбираясь
+/// в архиве. По истечении срока предмет из каталога уходит, но не пропадает:
+/// восстановить его можно и потом.
+pub(crate) const WRITE_OFF_GRACE_MINUTES: i64 = 15;
 
 /// Предельный размер одного вложения после раскодирования.
 ///

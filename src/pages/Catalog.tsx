@@ -51,6 +51,10 @@ const countFilters = (f: Filters) =>
   f.assignees.length + f.sites.length + f.warehouses.length + f.categories.length + f.brands.length + f.statuses.length + (f.qr ? 1 : 0)
 
 type SortKey = 'new' | 'name' | 'vn' | 'price'
+/** Столько минут списанный предмет ещё виден в каталоге. Должно совпадать
+ *  с WRITE_OFF_GRACE_MINUTES на сервере: расхождение собьёт обратный отсчёт. */
+const WRITE_OFF_GRACE_MINUTES = 15
+
 type ViewMode = 'grid' | 'table'
 
 const PAGE_SIZE = 8
@@ -219,6 +223,11 @@ export default function Catalog() {
   const brands = brandsQ.data ?? []
   const statuses = statusesQ.data ?? []
 
+  // Списание пачкой: подтверждение обязательно, причина тоже — иначе через
+  // месяц никто не вспомнит, почему инструмента нет.
+  const [writeOffOpen, setWriteOffOpen] = useState(false)
+  const [writeOffReason, setWriteOffReason] = useState('')
+  const [writingOff, setWritingOff] = useState(false)
   const [view, setView] = useState<ViewMode>('grid')
   const [sort, setSort] = useState<SortKey>('new')
   const [query, setQuery] = useState(searchParams.get('q') ?? '')
@@ -521,6 +530,42 @@ export default function Catalog() {
     </div>
   )
 
+  const writeOff = trpc.history.writeOff.useMutation()
+
+  const doWriteOff = async () => {
+    const ids = [...selectedToolIds].map(Number).filter((n) => Number.isFinite(n) && n > 0)
+    if (ids.length === 0) return
+    const reason = writeOffReason.trim()
+    if (reason.length < 3) {
+      setToast('Укажите причину списания')
+      return
+    }
+    setWritingOff(true)
+    let done = 0
+    const failed: string[] = []
+    for (const id of ids) {
+      try {
+        await writeOff.mutateAsync({ itemId: id, comment: reason })
+        done += 1
+      } catch (e) {
+        // Каждую неудачу называем отдельно: списание пачкой не должно
+        // молча пропускать предметы.
+        failed.push(e instanceof Error ? e.message : 'неизвестная ошибка')
+      }
+    }
+    await utils.items.list.invalidate()
+    setWritingOff(false)
+    setWriteOffOpen(false)
+    setWriteOffReason('')
+    setSelectionMode(false)
+    clearSelection()
+    setToast(
+      failed.length === 0
+        ? `Списано: ${done}. Вернуть можно из архива`
+        : `Списано ${done}, не удалось ${failed.length}: ${failed[0]}`,
+    )
+  }
+
   const enterSelection = (id: string, checked: boolean) => {
     if (!selectionMode) setSelectionMode(true)
     setToolSelected(id, checked)
@@ -672,11 +717,11 @@ export default function Catalog() {
               Печать QR
             </button>
             <button
-              onClick={() => setToast('Списание доступно руководителю')}
+              onClick={() => setWriteOffOpen(true)}
               className="inline-flex items-center gap-1.5 h-8 px-3.5 rounded-xl border border-danger text-[13px] font-semibold text-danger hover:bg-danger-bg transition"
             >
               <Trash2 size={14} />
-              Списать
+              Списать всё
             </button>
           </motion.div>
         ) : (
@@ -929,6 +974,64 @@ export default function Catalog() {
           >
             <CheckCircle2 size={16} className="text-teal" />
             {toast}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Подтверждение списания. Списание — действие тяжёлое: спрашиваем
+          причину и прямо говорим, что предмет не исчезнет насовсем. */}
+      <AnimatePresence>
+        {writeOffOpen && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[70] flex items-center justify-center bg-ink-900/40 px-4"
+            onClick={() => !writingOff && setWriteOffOpen(false)}
+          >
+            <motion.div
+              initial={{ opacity: 0, scale: 0.96, y: 12 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.96, y: 12 }}
+              onClick={(e) => e.stopPropagation()}
+              className="w-full max-w-md rounded-card bg-surface p-5 shadow-modal"
+            >
+              <h3 className="text-lg font-bold text-ink-900">
+                Списать {selectedCount} {selectedCount === 1 ? 'предмет' : 'предметов'}?
+              </h3>
+              <p className="mt-2 text-sm leading-5 text-ink-500">
+                Предметы погаснут в каталоге и через {WRITE_OFF_GRACE_MINUTES} минут уйдут в
+                архив. История выдач сохранится, вернуть их можно и потом.
+              </p>
+              <label className="mt-4 block text-[13px] font-semibold text-ink-900">
+                Причина списания
+              </label>
+              <input
+                autoFocus
+                value={writeOffReason}
+                onChange={(e) => setWriteOffReason(e.target.value)}
+                placeholder="Сломан, утерян, изношен…"
+                className="mt-1.5 h-11 w-full rounded-xl border border-brand-100 bg-surface px-3 text-sm text-ink-900 outline-none focus:border-brand-600 focus:ring-[3px] focus:ring-brand-600/15"
+              />
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  type="button"
+                  disabled={writingOff}
+                  onClick={() => setWriteOffOpen(false)}
+                  className="h-10 rounded-xl border border-brand-100 px-4 text-sm font-semibold text-ink-900 hover:bg-brand-50 disabled:opacity-60"
+                >
+                  Отмена
+                </button>
+                <button
+                  type="button"
+                  disabled={writingOff || writeOffReason.trim().length < 3}
+                  onClick={() => void doWriteOff()}
+                  className="h-10 rounded-xl bg-danger px-4 text-sm font-semibold text-white hover:opacity-90 disabled:opacity-60"
+                >
+                  {writingOff ? 'Списываем…' : 'Списать'}
+                </button>
+              </div>
+            </motion.div>
           </motion.div>
         )}
       </AnimatePresence>

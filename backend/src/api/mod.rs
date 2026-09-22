@@ -749,6 +749,8 @@ fn dispatch_inner(
         "items.create" => items_create(conn, input, user_id),
         "items.update" => items_update(conn, input, user_id),
         "items.remove" => items_remove(conn, input, user_id),
+        "items.restore" => items_restore(conn, input, user_id),
+        "items.confirmResponsibility" => items_confirm_responsibility(conn, input, user_id),
         "items.addPhoto" => items_add_photo(conn, input, user_id),
         "items.addComment" => items_add_comment(conn, input, user_id),
         "items.reportFault" => report_fault(conn, input, user_id),
@@ -1510,9 +1512,9 @@ mod tests {
         cleanup(conn, path);
     }
 
-    /// Карточку можно завести сразу с ответственным, минуя выдачу. Тогда в
-    /// истории обязана быть запись, иначе предмет числится за человеком, а
-    /// объяснить это нечем.
+    /// Карточку можно завести сразу на себя, минуя выдачу. Тогда в истории
+    /// обязана быть запись, иначе предмет числится за человеком, а объяснить
+    /// это нечем. Назначение другого идёт иначе — через подтверждение.
     #[test]
     fn item_created_with_a_holder_is_journalled() {
         let (mut conn, path, users, ws) = test_db();
@@ -1522,7 +1524,7 @@ mod tests {
             &json!({
                 "title": "Перфоратор",
                 "workspaceId": ws,
-                "responsibleUserId": users[1],
+                "responsibleUserId": users[0],
             }),
             Some(users[0]),
         )
@@ -2328,6 +2330,172 @@ mod tests {
             Some(worker),
         );
         assert!(denied.is_err(), "участник не может выписывать приглашения");
+        cleanup(conn, path);
+    }
+
+    /// Списание не удаляет карточку: предмет гаснет в каталоге на льготный
+    /// срок, потом уходит в архив, откуда его можно вернуть. Удаление без
+    /// возврата для учёта не годится — ошиблись списком, и данных нет.
+    #[test]
+    fn written_off_item_waits_in_the_catalog_then_moves_to_the_archive() {
+        let (mut conn, path, users, ws) = test_db();
+        // Списание опирается на статус «written-off»: в группе, заведённой
+        // напрямую, справочников ещё нет.
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+
+        dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": item, "comment": "Сломан безвозвратно"}),
+            Some(users[0]),
+        )
+        .expect("списание");
+
+        // Сразу после списания предмет ещё виден в каталоге — чтобы успеть
+        // передумать, не разбираясь в архиве.
+        let catalog = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(
+            catalog["total"].as_i64(),
+            Some(1),
+            "списанный ещё в каталоге"
+        );
+        let archive = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "archived": true}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(archive["total"].as_i64(), Some(0), "в архив рано");
+
+        // Отматываем отметку назад — как будто льготный срок истёк.
+        conn.execute(
+            "UPDATE items SET written_off_at=?1 WHERE id=?2",
+            params![
+                (chrono::Utc::now() - chrono::Duration::minutes(WRITE_OFF_GRACE_MINUTES + 1))
+                    .to_rfc3339(),
+                item
+            ],
+        )
+        .unwrap();
+
+        let catalog = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(catalog["total"].as_i64(), Some(0), "из каталога ушёл");
+        let archive = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws, "archived": true}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(archive["total"].as_i64(), Some(1), "и появился в архиве");
+
+        // Возврат из архива.
+        dispatch(
+            &mut conn,
+            "items.restore",
+            &json!({"id": item}),
+            Some(users[0]),
+        )
+        .expect("восстановление");
+        let back = dispatch(
+            &mut conn,
+            "items.list",
+            &json!({"workspaceId": ws}),
+            Some(users[0]),
+        )
+        .unwrap();
+        assert_eq!(back["total"].as_i64(), Some(1), "вернулся в каталог");
+        cleanup(conn, path);
+    }
+
+    /// Ответственным можно назначить любого, но пока он не подтвердил —
+    /// предмет не выдаётся. Иначе человек узнавал бы о своей ответственности,
+    /// когда с него спросят за пропажу.
+    #[test]
+    fn assigned_responsibility_waits_for_confirmation_before_the_item_circulates() {
+        let (mut conn, path, users, ws) = test_db();
+
+        let created = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Перфоратор", "responsibleUserId": users[1]}),
+            Some(users[0]),
+        )
+        .expect("создание с чужим ответственным");
+        let item = created["id"].as_i64().unwrap();
+
+        assert_eq!(
+            created["responsibleUserId"].as_i64(),
+            None,
+            "до подтверждения предмет ни за кем не числится"
+        );
+        assert_eq!(
+            created["pendingResponsibleId"].as_i64(),
+            Some(users[1]),
+            "назначение должно ждать подтверждения"
+        );
+
+        // Выдать нельзя, пока не подтвердил.
+        let blocked = dispatch(
+            &mut conn,
+            "transfers.take",
+            &json!({"itemId": item}),
+            Some(users[2]),
+        );
+        assert!(
+            blocked.is_err(),
+            "выдача до подтверждения должна быть закрыта"
+        );
+
+        // Чужой подтвердить не может.
+        let stranger = dispatch(
+            &mut conn,
+            "items.confirmResponsibility",
+            &json!({"id": item}),
+            Some(users[2]),
+        );
+        assert!(stranger.is_err(), "подтверждает только назначенный");
+
+        let confirmed = dispatch(
+            &mut conn,
+            "items.confirmResponsibility",
+            &json!({"id": item}),
+            Some(users[1]),
+        )
+        .expect("подтверждение назначенным");
+        assert_eq!(confirmed["responsibleUserId"].as_i64(), Some(users[1]));
+        assert_eq!(confirmed["pendingResponsibleId"].as_i64(), None);
+        cleanup(conn, path);
+    }
+
+    /// Назначивший сам себя ничего не подтверждает: соглашаться с собственным
+    /// решением незачем.
+    #[test]
+    fn assigning_yourself_needs_no_confirmation() {
+        let (mut conn, path, users, ws) = test_db();
+        let created = dispatch(
+            &mut conn,
+            "items.create",
+            &json!({"workspaceId": ws, "title": "Шуруповёрт", "responsibleUserId": users[0]}),
+            Some(users[0]),
+        )
+        .expect("создание с собой в ответственных");
+        assert_eq!(created["responsibleUserId"].as_i64(), Some(users[0]));
+        assert_eq!(created["pendingResponsibleId"].as_i64(), None);
         cleanup(conn, path);
     }
 
