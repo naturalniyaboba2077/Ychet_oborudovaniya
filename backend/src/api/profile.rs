@@ -18,6 +18,18 @@ pub(crate) fn profile_get(conn: &Connection, user_id: Option<i64>) -> ApiResult 
             .filter_map(|id| jsn::workspace_json(conn, id))
             .collect(),
     );
+    // Привязан ли Google — чтобы профиль показывал либо кнопку привязки,
+    // либо уже привязанную почту. Сам google_sub наружу не отдаём: клиенту
+    // он не нужен, а это идентификатор аккаунта в чужой системе.
+    let (email, linked): (Option<String>, bool) = conn
+        .query_row(
+            "SELECT email, google_sub IS NOT NULL AND google_sub <> '' FROM users WHERE id=?1",
+            params![uid],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+        )
+        .unwrap_or((None, false));
+    u["email"] = json!(email);
+    u["googleLinked"] = json!(linked);
     Ok(u)
 }
 

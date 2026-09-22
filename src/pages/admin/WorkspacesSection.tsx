@@ -218,6 +218,76 @@ function WorkspaceSettings({ ws }: { ws: WorkspaceDto }) {
 
 /* ─── Модалка создания пространства ───────────────────────────────────────── */
 
+/**
+ * Вступление в чужое пространство по коду приглашения.
+ *
+ * Создание и вступление — разные действия, и раньше отсюда было доступно
+ * только первое: чтобы попасть в чужую группу, приходилось выходить из
+ * аккаунта и заходить заново по ссылке. Роль задаёт приглашение, а не
+ * вступающий, поэтому здесь ничего выбрать нельзя — только предъявить код.
+ */
+function JoinWorkspaceModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const utils = trpc.useUtils()
+  const toast = useToast()
+  const [token, setToken] = useState('')
+  const join = trpc.auth.join.useMutation({
+    onSuccess: async () => {
+      await utils.invalidate()
+      toast('Вы вступили в пространство')
+      setToken('')
+      onClose()
+    },
+    onError: (e) => toast(e.message || 'Не удалось вступить', 'error'),
+  })
+
+  return (
+    <Modal open={open} onClose={onClose} title="Вступить по коду">
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault()
+          const clean = token.trim()
+          if (clean.length < 8) {
+            toast('Введите код приглашения', 'error')
+            return
+          }
+          join.mutate({ token: clean })
+        }}
+      >
+        <p className="text-sm leading-5 text-ink-500">
+          Код даёт администратор нужного пространства — в виде строки или QR.
+          Роль в новом пространстве задаёт он же; в своих ваши права не
+          меняются.
+        </p>
+        <div>
+          <label className="mb-1.5 block text-[13px] font-semibold text-ink-900">
+            Код приглашения
+          </label>
+          <input
+            autoFocus
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            placeholder="Строка из QR администратора"
+            className="h-11 w-full rounded-xl border border-brand-100 bg-surface px-3 text-sm text-ink-900 outline-none transition-shadow focus:border-brand-600 focus:ring-[3px] focus:ring-brand-600/15"
+          />
+        </div>
+        <div className="flex justify-end gap-2 pt-1">
+          <button type="button" className={btnSecondaryCls} onClick={onClose}>
+            Отмена
+          </button>
+          <button
+            type="submit"
+            className={btnPrimaryCls}
+            disabled={token.trim().length < 8 || join.isPending}
+          >
+            {join.isPending ? 'Вступаем…' : 'Вступить'}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  )
+}
+
 function CreateWorkspaceModal({ open, onClose }: { open: boolean; onClose: () => void }) {
   const toast = useToast()
   const utils = trpc.useUtils()
@@ -315,6 +385,7 @@ export default function WorkspacesSection() {
   const { data: users } = trpc.admin.users.list.useQuery({})
   const { data: items } = trpc.reports.allItems.useQuery({})
   const [createOpen, setCreateOpen] = useState(false)
+  const [joinOpen, setJoinOpen] = useState(false)
   const [inviteUrl, setInviteUrl] = useState<string | null>(null)
   const [inviteRole, setInviteRole] = useState<InviteRole>('member')
   const [inviteExpiresAt, setInviteExpiresAt] = useState<string | null>(null)
@@ -390,10 +461,18 @@ export default function WorkspacesSection() {
         title="Рабочие пространства"
         count={workspaces?.length}
         action={
-          <button type="button" className={btnSecondaryCls} onClick={() => setCreateOpen(true)}>
-            <Plus size={16} />
-            Создать пространство
-          </button>
+          <div className="flex flex-wrap gap-2">
+            {/* Вступить можно только по приглашению: чужое пространство не
+                выбирают из списка, его открывает администратор. */}
+            <button type="button" className={btnSecondaryCls} onClick={() => setJoinOpen(true)}>
+              <QrCode size={16} />
+              Вступить по коду
+            </button>
+            <button type="button" className={btnSecondaryCls} onClick={() => setCreateOpen(true)}>
+              <Plus size={16} />
+              Создать пространство
+            </button>
+          </div>
         }
       />
 
@@ -508,6 +587,7 @@ export default function WorkspacesSection() {
 
       {current && <WorkspaceSettings ws={current} />}
       <CreateWorkspaceModal open={createOpen} onClose={() => setCreateOpen(false)} />
+      <JoinWorkspaceModal open={joinOpen} onClose={() => setJoinOpen(false)} />
     </section>
   )
 }

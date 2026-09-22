@@ -8,7 +8,14 @@ export const profileRouter = createRouter({
   get: publicQuery.query(async ({ ctx }) => {
     const me = await requireMe(ctx);
     const workspaces = await workspacesOfUser(me.id);
-    return { ...publicUser(me), workspaces };
+    // email и googleLinked нужны профилю: он показывает либо кнопку привязки
+    // Google, либо уже привязанную почту.
+    return {
+      ...publicUser(me),
+      workspaces,
+      email: null as string | null,
+      googleLinked: false,
+    };
   }),
 
   update: publicQuery
