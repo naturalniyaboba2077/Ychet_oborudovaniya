@@ -1,0 +1,147 @@
+# Выкладка MeshKeeper на боевой сервер.
+#
+# Запускается только тегом vX.Y — ставят его по команде, обычный push в main
+# ничего не выкладывает. Собирает веб, сервер и (если менялась android/ или
+# это явно попросили) APK, выкладывает всё на сервер через
+# deploy/ci-deploy.sh и оформляет релиз на GitHub.
+#
+# Секреты (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST, DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS — вход на сервер ключом,
+#     которому разрешена только команда meshkeeper-ci-deploy;
+#   ANDROID_KEYSTORE_B64, ANDROID_STORE_PASSWORD, ANDROID_KEY_ALIAS,
+#     ANDROID_KEY_PASSWORD — подпись APK. Потеря keystore = телефоны не
+#     смогут обновиться, только переустановить.
+#   LEAKED_PATTERNS (необязательно) — scripts/leaked-patterns.local.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      apk:
+        description: 'Собирать APK'
+        type: choice
+        options: [auto, 'yes', 'no']
+        default: auto
+
+# Две выкладки одновременно на один сервер — никогда.
+concurrency:
+  group: production
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Нужен ли APK
+        id: apk
+        run: |
+          # Ручной запуск — только на теге: имя релиза берётся из него.
+          [ '${{ github.ref_type }}' = tag ] || { echo "запускайте на теге vX.Y" >&2; exit 1; }
+          want='${{ inputs.apk || 'auto' }}'
+          if [ "$want" = auto ]; then
+            prev=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)
+            if [ -z "$prev" ] || ! git diff --quiet "$prev" HEAD -- android/; then want=yes; else want=no; fi
+            echo "предыдущий тег: ${prev:-нет}"
+          fi
+          echo "build=$want" >> "$GITHUB_OUTPUT"
+          echo "APK: $want"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend -> ../.build/cargo
+
+      - name: Тесты сервера
+        working-directory: backend
+        run: cargo test --release --target-dir ../.build/cargo
+
+      - name: Сборка веба и сервера
+        env:
+          LEAKED_PATTERNS: ${{ secrets.LEAKED_PATTERNS }}
+        run: |
+          [ -n "$LEAKED_PATTERNS" ] && printf '%s\n' "$LEAKED_PATTERNS" > scripts/leaked-patterns.local
+          npm ci
+          npm run build
+
+      - uses: actions/setup-java@v4
+        if: steps.apk.outputs.build == 'yes'
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        if: steps.apk.outputs.build == 'yes'
+        with:
+          gradle-version: '8.7'
+
+      - name: Сборка APK
+        if: steps.apk.outputs.build == 'yes'
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          MESHKEEPER_ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          MESHKEEPER_ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MESHKEEPER_ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # Номер версии — на единицу больше того, что сейчас раздаёт сервер:
+          # телефоны сравнивают именно с ним (backend/src/apk.rs).
+          last=$(curl -fsS https://31-172-72-140.sslip.io/api/app/android | jq -r .versionCode)
+          code=$((last + 1))
+          echo "versionCode $last → $code"
+          export MESHKEEPER_ANDROID_KEYSTORE="$RUNNER_TEMP/release.jks"
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$MESHKEEPER_ANDROID_KEYSTORE"
+          cd android
+          gradle --no-daemon :app:publishApk -PmkVersionCode=$code
+          rm -f "$MESHKEEPER_ANDROID_KEYSTORE"
+          ls -la ../dist/android
+
+      - name: Пакет выкладки
+        run: |
+          mkdir -p pkg
+          cp dist/server/meshkeeper-node pkg/
+          cp -a dist/public pkg/public
+          [ -d dist/android ] && cp -a dist/android pkg/android
+          tar -czf deploy.tar.gz -C pkg .
+          ls -la deploy.tar.gz
+
+      - name: Выкладка на сервер
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          HOST: ${{ secrets.DEPLOY_HOST }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy && chmod 600 ~/.ssh/deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # Команду выбирает сервер (command= в authorized_keys), здесь только данные.
+          ssh -i ~/.ssh/deploy -o IdentitiesOnly=yes -o BatchMode=yes root@"$HOST" < deploy.tar.gz
+          rm -f ~/.ssh/deploy
+
+      - name: Релиз на GitHub
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf meshkeeper-node-linux-x86_64.tar.gz -C dist/server meshkeeper-node
+          files=(meshkeeper-node-linux-x86_64.tar.gz)
+          [ -d dist/android ] && files+=(dist/android/*.apk)
+          tag='${{ github.ref_name }}'
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${files[@]}" --clobber
+          else
+            gh release create "$tag" "${files[@]}" --title "$tag" --generate-notes
+          fi
