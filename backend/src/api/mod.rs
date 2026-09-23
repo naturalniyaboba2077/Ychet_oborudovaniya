@@ -42,6 +42,14 @@ thread_local! {
     /// Адрес, с которого пришёл текущий запрос. Нужен счётчику регистраций:
     /// открытая дверь без него — приглашение набить базу мусором.
     static CURRENT_ADDR: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+    /// Организация, выбранная в интерфейсе (заголовок `x-mk-workspace`).
+    static ACTIVE_WS: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// Запоминает организацию, выбранную в интерфейсе, на время запроса.
+/// Это лишь пожелание клиента: членство проверяет `own_workspace`.
+pub fn set_active_workspace(ws: Option<i64>) {
+    ACTIVE_WS.with(|c| c.set(ws));
 }
 
 /// Запоминает адрес клиента на время обработки запроса.
@@ -62,18 +70,10 @@ pub(crate) fn client_address() -> String {
 }
 
 fn ws_fallback(conn: &Connection) -> i64 {
-    CURRENT_UID.with(|c| {
-        if let Some(uid) = c.get() {
-            if let Ok(id) = conn.query_row(
-                "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY id DESC LIMIT 1",
-                params![uid],
-                |r| r.get(0),
-            ) {
-                return id;
-            }
-        }
-        jsn::default_ws(conn)
-    })
+    CURRENT_UID
+        .with(|c| c.get())
+        .and_then(|uid| own_workspace(conn, uid))
+        .unwrap_or_else(|| jsn::default_ws(conn))
 }
 
 #[derive(Debug)]
@@ -344,10 +344,29 @@ fn require_can_in_workspace(
     }
 }
 
-/// Пространство пользователя по умолчанию — то же, которое подставит `ws_fallback`.
+/// Организация, в которой человек сейчас работает, если запрос её не назвал.
+///
+/// Это выбранная в интерфейсе (`x-mk-workspace`), если человек в ней
+/// состоит, иначе — первая по вступлению: её же интерфейс показывает по
+/// умолчанию. Раньше здесь бралась последняя, и после вступления во вторую
+/// организацию экран показывал одну, а данные и права шли из другой.
 fn own_workspace(conn: &Connection, uid: i64) -> Option<i64> {
+    let member = |ws: i64| {
+        conn.query_row(
+            "SELECT 1 FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
+            params![uid, ws],
+            |_| Ok(()),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .is_some()
+    };
+    if let Some(ws) = ACTIVE_WS.with(|c| c.get()).filter(|&ws| member(ws)) {
+        return Some(ws);
+    }
     conn.query_row(
-        "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY id DESC LIMIT 1",
+        "SELECT workspace_id FROM user_workspaces WHERE user_id=?1 ORDER BY id LIMIT 1",
         params![uid],
         |r| r.get(0),
     )
@@ -3670,6 +3689,177 @@ mod tests {
         // Миниатюры нет — подставляется тот же файл, карточка не пустая.
         assert_eq!(photo["thumbUrl"].as_str(), Some(stored));
         assert!(photo["sha256"].as_str().is_some());
+        cleanup(conn, path);
+    }
+
+    /// Массовое списание из каталога приходит без количества — это «убрать
+    /// предмет», и количественная карточка целиком уходит в архив, а не
+    /// теряет одну штуку. Списание части остатка из карточки не меняется.
+    #[test]
+    fn bulk_write_off_archives_a_quantitative_card_instead_of_taking_one_unit() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, true, Some(10.0));
+
+        dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": item, "quantity": 3, "comment": "Израсходовано"}),
+            Some(users[0]),
+        )
+        .expect("частичное списание");
+        let (qty, written): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT quantity, written_off_at FROM items WHERE id=?1",
+                params![item],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((qty, written.is_some()), (7.0, false), "часть остатка, карточка на месте");
+
+        dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": item, "comment": "Партия испорчена"}),
+            Some(users[0]),
+        )
+        .expect("списание карточки");
+        let (qty, written): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT quantity, written_off_at FROM items WHERE id=?1",
+                params![item],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(qty, 7.0, "остаток не тронут");
+        assert!(written.is_some(), "карточка списана и уйдёт в архив");
+        cleanup(conn, path);
+    }
+
+    #[test]
+    fn card_with_units_on_hands_is_not_written_off_whole() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, true, Some(5.0));
+        conn.execute(
+            "INSERT INTO item_holdings (item_id, user_id, quantity, created_at) VALUES (?1,?2,2,?3)",
+            params![item, users[1], now()],
+        )
+        .unwrap();
+        let err = dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": item, "comment": "Партия испорчена"}),
+            Some(users[0]),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("на руках"), "{}", err.message);
+        let written: Option<String> = conn
+            .query_row("SELECT written_off_at FROM items WHERE id=?1", params![item], |r| r.get(0))
+            .unwrap();
+        assert!(written.is_none());
+        cleanup(conn, path);
+    }
+
+    /// Архив — часть учёта: карточку можно вернуть, но не стереть. Ни в
+    /// льготный срок, ни после.
+    #[test]
+    fn written_off_card_cannot_be_deleted() {
+        let (mut conn, path, users, ws) = test_db();
+        seed_workspace_defaults(&conn, ws, users[0]).unwrap();
+        let item = insert_item(&conn, ws, None, false, None);
+        dispatch(
+            &mut conn,
+            "history.writeOff",
+            &json!({"itemId": item, "comment": "Утерян"}),
+            Some(users[0]),
+        )
+        .unwrap();
+        for stamp in [
+            now(),
+            (chrono::Utc::now() - chrono::Duration::days(30)).to_rfc3339(),
+        ] {
+            conn.execute(
+                "UPDATE items SET written_off_at=?1 WHERE id=?2",
+                params![stamp, item],
+            )
+            .unwrap();
+            let err = dispatch(&mut conn, "items.remove", &json!({"id": item}), Some(users[0]))
+                .unwrap_err();
+            assert_eq!(err.http, 403);
+        }
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items WHERE id=?1", params![item], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 1);
+        // Вернули в каталог — снова обычная карточка, её можно удалить.
+        dispatch(&mut conn, "items.restore", &json!({"id": item}), Some(users[0])).unwrap();
+        dispatch(&mut conn, "items.remove", &json!({"id": item}), Some(users[0]))
+            .expect("удаление восстановленного");
+        cleanup(conn, path);
+    }
+
+    /// Человек работает в двух организациях: в первой ему можно только
+    /// смотреть, вторую он создал сам. Права одной не должны действовать в
+    /// другой — в том числе в запросах, где интерфейс не передаёт
+    /// `workspaceId`, а выбранная организация приходит заголовком.
+    #[test]
+    fn rights_follow_the_selected_organisation_and_do_not_mix() {
+        let (mut conn, path, users, ws) = test_db();
+        let worker = users[1];
+        conn.execute(
+            "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
+            params![json!({"viewItems": true, "createItems": false}).to_string(), worker, ws],
+        )
+        .unwrap();
+        let own = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Своя бригада"}),
+            Some(worker),
+        )
+        .unwrap()["workspaceId"]
+            .as_i64()
+            .unwrap();
+        let foreign = dispatch(
+            &mut conn,
+            "auth.createWorkspace",
+            &json!({"name": "Чужая"}),
+            Some(users[0]),
+        )
+        .unwrap()["workspaceId"]
+            .as_i64()
+            .unwrap();
+
+        let create = |conn: &mut Connection, active: Option<i64>| {
+            set_active_workspace(active);
+            let out = dispatch(conn, "items.create", &json!({"title": "Перфоратор"}), Some(worker));
+            set_active_workspace(None);
+            out
+        };
+        // Без выбора — первая по вступлению, как в интерфейсе по умолчанию.
+        // Раньше бралась последняя, и права владельца своей группы
+        // срабатывали там, где человек лишь наблюдатель.
+        assert_eq!(create(&mut conn, None).unwrap_err().http, 403);
+        assert_eq!(create(&mut conn, Some(ws)).unwrap_err().http, 403);
+        let made = create(&mut conn, Some(own)).expect("в своей организации можно");
+        assert_eq!(made["workspaceId"].as_i64(), Some(own));
+        // Чужую организацию заголовком не выбрать: членства нет.
+        assert_eq!(create(&mut conn, Some(foreign)).unwrap_err().http, 403);
+        let in_foreign: i64 = conn
+            .query_row("SELECT COUNT(*) FROM items WHERE workspace_id=?1", params![foreign], |r| r.get(0))
+            .unwrap();
+        assert_eq!(in_foreign, 0);
+
+        // Список организаций несёт права каждой по отдельности.
+        CURRENT_UID.with(|c| c.set(Some(worker)));
+        let list = workspaces_list(&conn).unwrap();
+        let rights = |id: i64| {
+            list.as_array().unwrap().iter().find(|w| w["id"].as_i64() == Some(id)).unwrap()["rights"]
+                ["createItems"]
+                .as_bool()
+        };
+        assert_eq!((rights(ws), rights(own)), (Some(false), Some(true)));
         cleanup(conn, path);
     }
 }

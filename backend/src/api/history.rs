@@ -120,7 +120,15 @@ pub(crate) fn history_write_off_atomic(
     }
     let item = jsn::item_json(conn, id, false).ok_or_else(|| ApiError::not_found("нет"))?;
     let ws = item["workspaceId"].as_i64().unwrap_or(1);
-    if item["quantitative"].as_bool().unwrap_or(false) {
+    // Количество приходит только из карточки предмета, где списывают часть
+    // остатка. Массовое списание из каталога шлёт один `itemId`: это решение
+    // «убрать предмет», а не «минус одна штука». Раньше у количественного
+    // предмета тут молча подставлялась единица — карточка оставалась в
+    // каталоге с остатком на штуку меньше, а человеку показывали «вернуть
+    // можно из архива».
+    let partial = item["quantitative"].as_bool().unwrap_or(false)
+        && input.get("quantity").is_some_and(|v| !v.is_null());
+    if partial {
         let qty = f64v(input, "quantity").unwrap_or(1.0);
         if qty <= 0.0 {
             return Err(ApiError::bad("Количество должно быть больше нуля"));
@@ -152,6 +160,19 @@ pub(crate) fn history_write_off_atomic(
         .map_err(|e| ApiError::internal(format!("Ошибка журнала: {e}")))?;
         attach_photo(conn, &entry, photo.as_deref())?;
     } else {
+        // Выданные на руки единицы списанием карточки не закрываем: иначе
+        // пропадёт след, у кого они остались.
+        let on_hands: f64 = conn.query_row(
+            "SELECT COALESCE(SUM(quantity),0) FROM item_holdings WHERE item_id=?1 AND returned_at IS NULL",
+            params![id],
+            |r| r.get(0),
+        )?;
+        if on_hands > 0.0 {
+            return Err(ApiError::bad(format!(
+                "«{}»: на руках {on_hands} ед. — сначала верните их на склад",
+                item["title"].as_str().unwrap_or("предмет")
+            )));
+        }
         let st = conn
             .query_row(
                 "SELECT id FROM statuses WHERE workspace_id=?1 AND slug='written-off'",

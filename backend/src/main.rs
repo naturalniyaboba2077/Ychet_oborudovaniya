@@ -5,6 +5,7 @@ mod google;
 mod json;
 mod ledger;
 mod sync;
+mod update;
 
 use axum::{
     body::Bytes,
@@ -149,6 +150,12 @@ async fn trpc(
         .map(|v| v.trim().to_string())
         .unwrap_or_default();
     api::set_client_address(&client_addr);
+    api::set_active_workspace(
+        headers
+            .get("x-mk-workspace")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok()),
+    );
 
     let token = session_token(&headers).map(str::to_owned);
     let batched = calls.len() > 1 || q.get("batch").map(|s| s.as_str()) == Some("1");
@@ -235,7 +242,7 @@ async fn static_cache_headers(
     res
 }
 
-async fn spa_index(State(index): State<Arc<PathBuf>>, uri: Uri) -> impl IntoResponse {
+async fn spa_index(State(frontend): State<Arc<update::Frontend>>, uri: Uri) -> Response {
     // Отсутствующий ассет должен оставаться 404, иначе сломанный бандл
     // возвращает HTML вместо скрипта и ошибка становится незаметной.
     let path = uri.path();
@@ -246,22 +253,7 @@ async fn spa_index(State(index): State<Arc<PathBuf>>, uri: Uri) -> impl IntoResp
     if path.starts_with("/assets/") || looks_like_file {
         return (StatusCode::NOT_FOUND, "Файл не найден").into_response();
     }
-    match tokio::fs::read(index.as_path()).await {
-        Ok(bytes) => (
-            StatusCode::OK,
-            [
-                (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                (axum::http::header::CACHE_CONTROL, "no-cache"),
-            ],
-            bytes,
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::NOT_FOUND,
-            "UI не собран. Выполните: npm run build",
-        )
-            .into_response(),
-    }
+    update::index_response(&frontend).await
 }
 
 /// Возвращение от Google. Отдаёт HTML, а не редирект, намеренно: сессионная
@@ -780,8 +772,11 @@ async fn main() {
     // Маршруты SPA (/tool/1, /join?token=…) должны отдавать index.html со
     // статусом 200: ServeFile как not_found_service сохранял 404, из-за чего
     // ссылка-приглашение выглядела как «страница не найдена».
+    // Следит за каталогом сборки и сообщает открытым клиентам о новой
+    // версии интерфейса — см. update.rs.
+    let frontend = update::start(web_root.clone());
     let static_files = ServeDir::new(&web_root)
-        .fallback(any(spa_index).with_state(Arc::new(web_root.join("index.html"))));
+        .fallback(any(spa_index).with_state(frontend.clone()));
     // Заголовки кэша приходится навешивать слоем: ServeDir их не ставит
     // вовсе, и браузер решает сам. На странице это оборачивалось тем, что
     // после выкладки человек продолжал открывать старую сборку — особенно
@@ -799,6 +794,7 @@ async fn main() {
         .route("/auth/google/callback", get(google_callback))
         .route("/files/{name}", get(serve_attachment))
         .route("/api/trpc/{*procedures}", any(trpc))
+        .merge(update::routes(frontend))
         // Предел на размер запроса. Без него любой желающий заливает сколько
         // угодно: тело читается в память целиком, а снимки теперь ещё и
         // ложатся на диск. Двадцать мегабайт — с запасом на карточку с

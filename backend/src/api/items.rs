@@ -609,6 +609,24 @@ pub(crate) fn items_remove(conn: &Connection, input: &Value, user_id: Option<i64
     // Право спрашиваем в группе предмета, а не глобально: в одном
     // аккаунте роли в разных организациях разные.
     require_can_in_workspace(conn, uid, ws, "deleteItems")?;
+    // Списанная карточка — часть учёта: по ней отвечают за то, куда делось
+    // имущество. Удалить её нельзя ни в льготный срок, ни из архива —
+    // только вернуть в каталог.
+    let written_off: bool = conn
+        .query_row(
+            "SELECT written_off_at IS NOT NULL FROM items WHERE id=?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if written_off {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Списанный предмет хранится в архиве и не удаляется",
+        ));
+    }
     conn.execute("DELETE FROM item_photos WHERE item_id=?1", params![id])?;
     conn.execute("DELETE FROM items WHERE id=?1", params![id])?;
     Ok(json!({"ok": true}))

@@ -776,6 +776,7 @@ dependencies = [
  "base64",
  "chacha20poly1305",
  "chrono",
+ "futures-util",
  "hex",
  "parking_lot",
  "rand 0.8.8",
