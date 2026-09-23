@@ -69,6 +69,19 @@ grep -q "MESHKEEPER_BIND=$BIND" "$UNIT" || {
 }
 scp -q "$UNIT" "$TARGET:$DIR/incoming/meshkeeper.service"
 
+# Android-приложение, если собрано (gradle :app:publishApk). Сервис отдаёт
+# телефонам APK с наибольшим номером, поэтому кладём сразу в apk/, а не через
+# activate. Сначала под именем .part и лишь затем переименовываем: иначе
+# телефон мог бы застать недокопированный файл.
+APK="$(ls "$ROOT"/dist/android/meshkeeper-*.apk 2>/dev/null | sort -V | tail -n 1 || true)"
+if [[ -n "$APK" ]]; then
+  NAME="$(basename "$APK")"
+  echo "→ Выкладываю $NAME"
+  ssh -n "$TARGET" "mkdir -p '$DIR/apk'"
+  scp -q "$APK" "$TARGET:$DIR/apk/$NAME.part"
+  ssh -n "$TARGET" "mv '$DIR/apk/$NAME.part' '$DIR/apk/$NAME'"
+fi
+
 echo "→ Переключаю сервис"
 # Единственная команда, разрешённая деплой-пользователю через sudo. Она ставится
 # скриптом deploy/bootstrap.ps1 и делает переключение целиком, поэтому в sudoers

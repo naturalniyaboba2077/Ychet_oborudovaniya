@@ -1,6 +1,7 @@
-import { createContext, useContext, useMemo, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { trpc } from '@/providers/trpc'
+import { activeWorkspaceId, rememberActiveWorkspace } from '@/lib/active-workspace'
 
 interface Workspace {
   id: number
@@ -42,13 +43,37 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const countsQ = trpc.meta.transferCounts.useQuery(undefined, { enabled: !!meQ.data, retry: 0 })
   const unreadQ = trpc.notifications.unreadCount.useQuery(undefined, { enabled: !!meQ.data, retry: 0 })
 
-  const [workspaceOverride, setWorkspace] = useState<Workspace | null>(null)
+  const utils = trpc.useUtils()
+  const [chosenId, setChosenId] = useState<number | null>(() => activeWorkspaceId())
   const [selectedToolIds, setSelectedToolIds] = useState<Set<string>>(new Set())
   const [selectionMode, setSelectionMode] = useState(false)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
 
   const workspaces = useMemo(() => wsQ.data ?? [], [wsQ.data])
-  const workspace = workspaceOverride ?? workspaces[0] ?? null
+  // Запомненная организация, если человек в ней ещё состоит, иначе первая.
+  const workspace = workspaces.find((w) => w.id === chosenId) ?? workspaces[0] ?? null
+
+  // Пока список не загружен, запомненный выбор не трогаем — иначе он
+  // сбрасывался бы при каждом запуске.
+  useEffect(() => {
+    if (wsQ.data && workspace && activeWorkspaceId() !== workspace.id) {
+      rememberActiveWorkspace(workspace.id)
+    }
+  }, [wsQ.data, workspace])
+
+  const setWorkspace = useCallback(
+    (ws: Workspace) => {
+      // Сначала заголовок, потом перезапросы — чтобы они ушли уже с ним.
+      rememberActiveWorkspace(ws.id)
+      setChosenId(ws.id)
+      setSelectedToolIds(new Set())
+      setSelectionMode(false)
+      // Часть запросов не содержит workspaceId в ключе кэша, и без этого
+      // на экране остались бы данные прежней организации.
+      void utils.invalidate()
+    },
+    [utils]
+  )
 
   const value = useMemo<AppStore>(() => {
     const toggleToolSelected = (id: string) => {
@@ -102,6 +127,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, [
     workspace,
     workspaces,
+    setWorkspace,
     meQ.data,
     selectedToolIds,
     selectionMode,

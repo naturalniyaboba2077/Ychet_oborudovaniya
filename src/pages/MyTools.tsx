@@ -1223,13 +1223,15 @@ export default function MyTools() {
           animate={{ opacity: 1, y: 0 }}
           transition={{ duration: 0.28, delay: 0.05, ease: [0.22, 1, 0.36, 1] }}
         >
-          <Link
-            to="/create"
-            className="inline-flex items-center gap-2 h-10 px-5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
-          >
-            <Plus size={16} strokeWidth={2.25} />
-            Создать инструмент
-          </Link>
+          {can('createItems') && (
+            <Link
+              to="/create"
+              className="inline-flex items-center gap-2 h-10 px-5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
+            >
+              <Plus size={16} strokeWidth={2.25} />
+              Создать инструмент
+            </Link>
+          )}
         </motion.div>
       </div>
 
@@ -1564,13 +1566,15 @@ export default function MyTools() {
             <img src="/empty-catalog.svg" alt="" className="w-60 h-auto rounded-2xl" />
             <h3 className="mt-5 text-[17px] font-semibold text-ink-900">На вас ничего не числится</h3>
             <p className="mt-1 text-[13px] text-ink-500">Когда вам передадут инструмент, он появится здесь</p>
-            <Link
-              to="/create"
-              className="mt-4 inline-flex items-center gap-2 h-10 px-5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
-            >
-              <Plus size={16} strokeWidth={2.25} />
-              Создать инструмент
-            </Link>
+            {can('createItems') && (
+              <Link
+                to="/create"
+                className="mt-4 inline-flex items-center gap-2 h-10 px-5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
+              >
+                <Plus size={16} strokeWidth={2.25} />
+                Создать инструмент
+              </Link>
+            )}
           </motion.div>
         ) : nothingFound ? (
           /* Empty state: ничего не найдено */

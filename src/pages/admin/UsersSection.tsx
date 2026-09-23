@@ -21,6 +21,8 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/comp
 import type { RoleRights } from '@db/schema'
 import { trpc } from '@/providers/trpc'
 import { cn } from '@/lib/utils'
+import { useCan } from '@/lib/rights'
+import { useStore } from '@/lib/store'
 import type { AdminUser } from './types'
 import {
   Modal,
@@ -85,9 +87,27 @@ const FALLBACK_DEFAULT_RIGHTS: RoleRights = {
   manageDictionaries: false,
 }
 
+/**
+ * Создатель пространства — тот, у кого есть `manageWorkspaces`: это право
+ * выдаётся только при создании и не передаётся (`check_rights_change` в
+ * backend/src/api/admin.rs).
+ */
 function isOwner(rights: RoleRights | null | undefined): boolean {
-  if (!rights) return false
-  return RIGHTS_META.every((r) => rights[r.key])
+  return rights?.manageWorkspaces === true
+}
+
+/** Администратор раздаёт права сотрудникам; назначает его только создатель. */
+function isAdmin(rights: RoleRights | null | undefined): boolean {
+  return rights?.manageUsers === true && !isOwner(rights)
+}
+
+/**
+ * Может ли текущий человек менять права, статус и членство `target`.
+ * Подсказка для интерфейса — решает сервер.
+ */
+function canManage(iAmOwner: boolean, target: RoleRights | null | undefined): boolean {
+  if (isOwner(target)) return false
+  return iAmOwner || !isAdmin(target)
 }
 
 const STATUS_META: Record<string, { label: string; cls: string }> = {
@@ -185,6 +205,8 @@ function RightsModal({
 }) {
   const toast = useToast()
   const utils = trpc.useUtils()
+  const iAmOwner = useCan()('manageWorkspaces')
+  const locked = !canManage(iAmOwner, user?.roleRights)
   const { data: defaultRights } = trpc.admin.users.defaultRights.useQuery()
   const [rights, setRights] = useState<RoleRights | null>(null)
   const [requireApproval, setRequireApproval] = useState<boolean | null>(null)
@@ -209,7 +231,7 @@ function RightsModal({
   })
 
   const applyPreset = (name: string) => {
-    if (name === 'Владелец') setRights(allRights(true))
+    if (name === 'Администратор') setRights({ ...allRights(true), manageWorkspaces: false })
     else if (name === 'Кладовщик') setRights({ ...(defaultRights ?? FALLBACK_DEFAULT_RIGHTS) })
     else if (name === 'Прораб')
       setRights({
@@ -255,8 +277,17 @@ function RightsModal({
             </div>
           </div>
 
-          <div className="mb-4 flex flex-wrap gap-2">
-            {['Владелец', 'Кладовщик', 'Прораб', 'Наблюдатель'].map((p) => (
+          {locked && (
+            <p className="mb-4 rounded-xl bg-brand-50 px-4 py-3 text-[13px] leading-5 text-ink-500">
+              {isOwner(user.roleRights)
+                ? 'Это создатель пространства: его права полные и не меняются.'
+                : 'Права администраторов меняет только создатель пространства.'}
+            </p>
+          )}
+
+          <div className={cn('mb-4 flex flex-wrap gap-2', locked && 'hidden')}>
+            {/* Администратора назначает только создатель — остальным пресет не показываем. */}
+            {[...(iAmOwner ? ['Администратор'] : []), 'Кладовщик', 'Прораб', 'Наблюдатель'].map((p) => (
               <button
                 key={p}
                 type="button"
@@ -282,6 +313,13 @@ function RightsModal({
                     <Toggle
                       checked={current[r.key]}
                       onChange={(v) => setRights({ ...current, [r.key]: v })}
+                      // Права создателя не передаются никому, а право раздавать
+                      // права (стать администратором) выдаёт только создатель.
+                      disabled={
+                        locked ||
+                        r.key === 'manageWorkspaces' ||
+                        (r.key === 'manageUsers' && !iAmOwner)
+                      }
                     />
                   </div>
                   <div className="min-w-0">
@@ -342,7 +380,7 @@ function RightsModal({
             <button
               type="button"
               className={btnPrimaryCls}
-              disabled={update.isPending}
+              disabled={update.isPending || locked}
               onClick={() =>
                 update.mutate({
                   id: user.id,
@@ -372,6 +410,10 @@ export default function UsersSection() {
   const utils = trpc.useUtils()
   const { data: users, isLoading } = trpc.admin.users.list.useQuery({})
   const { data: workspaces } = trpc.admin.workspaces.list.useQuery()
+  // Текущая организация. Раньше бралась первая из списка всех организаций
+  // сервера: исключение участника уходило не туда, где его нажали.
+  const { workspace } = useStore()
+  const iAmOwner = useCan()('manageWorkspaces')
 
   const [search, setSearch] = useState('')
   const [inviteOpen, setInviteOpen] = useState(false)
@@ -408,7 +450,7 @@ export default function UsersSection() {
     })
   }, [users, search])
 
-  const currentWsName = workspaces?.[0]?.name ?? '—'
+  const currentWsName = workspace?.name ?? workspaces?.[0]?.name ?? '—'
 
   return (
     <section>
@@ -475,7 +517,13 @@ export default function UsersSection() {
                             {isOwner(u.roleRights) && (
                               <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-brand-50 px-2 py-0.5 text-[11px] font-semibold text-brand-600">
                                 <ShieldCheck size={12} />
-                                Владелец
+                                Создатель
+                              </span>
+                            )}
+                            {isAdmin(u.roleRights) && (
+                              <span className="inline-flex shrink-0 items-center gap-1 rounded-full bg-brand-50 px-2 py-0.5 text-[11px] font-semibold text-brand-600">
+                                <ShieldCheck size={12} />
+                                Администратор
                               </span>
                             )}
                           </div>
@@ -521,6 +569,7 @@ export default function UsersSection() {
                             Права доступа
                           </DropdownMenuItem>
                           <DropdownMenuItem
+                            disabled={!canManage(iAmOwner, u.roleRights)}
                             onClick={() =>
                               update.mutate({
                                 id: u.id,
@@ -543,6 +592,7 @@ export default function UsersSection() {
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-danger focus:text-danger"
+                            disabled={!canManage(iAmOwner, u.roleRights)}
                             onClick={() => setRemoveUser(u)}
                           >
                             <Trash2 size={16} className="mr-2" />
@@ -565,7 +615,7 @@ export default function UsersSection() {
         open={!!removeUser}
         onClose={() => setRemoveUser(null)}
         onConfirm={() =>
-          removeUser && remove.mutate({ id: removeUser.id, workspaceId: workspaces?.[0]?.id })
+          removeUser && remove.mutate({ id: removeUser.id, workspaceId: workspace?.id })
         }
         title="Исключить участника?"
         text={`${removeUser?.fullName ?? ''} будет удалён из рабочего пространства. История операций сохранится.`}

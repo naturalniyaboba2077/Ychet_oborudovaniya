@@ -14,20 +14,30 @@ import {
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
+import { useCan, type RightKey } from '@/lib/rights'
 
-const navItems = [
+const navItems: Array<{
+  to: string
+  label: string
+  icon: typeof Wrench
+  end?: boolean
+  badge?: boolean
+  rights?: RightKey[]
+}> = [
   { to: '/', label: 'Все инструменты', icon: Wrench, end: true },
-  { to: '/invite', label: 'Пригласить по QR', icon: QrCode },
+  { to: '/invite', label: 'Пригласить по QR', icon: QrCode, rights: ['manageUsers'] },
   { to: '/my', label: 'Мои инструменты', icon: Package },
   { to: '/transfers', label: 'Приём-передача', icon: ArrowLeftRight, badge: true },
-  { to: '/history', label: 'История', icon: History },
+  { to: '/history', label: 'История', icon: History, rights: ['viewHistory'] },
   { to: '/chat', label: 'Чат группы', icon: MessageCircle },
-  { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck },
-  { to: '/reports', label: 'Отчёты', icon: BarChart3 },
-  { to: '/admin', label: 'Панель управления', icon: Settings2 },
+  { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck, rights: ['inventory'] },
+  { to: '/reports', label: 'Отчёты', icon: BarChart3, rights: ['viewReports'] },
+  { to: '/admin', label: 'Панель управления', icon: Settings2, rights: ['manageUsers', 'manageWorkspaces', 'manageStorages', 'manageSites', 'manageDictionaries'] },
 ]
 
 export default function Sidebar() {
+  // Меню — по правам в текущей организации: в разных организациях они разные.
+  const can = useCan()
   const { sidebarCollapsed, toggleSidebar, transfersToSend, transfersToReceive, currentUser } = useStore()
   const navigate = useNavigate()
   const transferCount = transfersToSend + transfersToReceive
@@ -56,7 +66,7 @@ export default function Sidebar() {
 
       {/* Навигация */}
       <nav className="flex-1 overflow-y-auto py-3 px-2 space-y-1">
-        {navItems.map((item) => (
+        {navItems.filter((item) => !item.rights || item.rights.some(can)).map((item) => (
           <NavLink
             key={item.to}
             to={item.to}

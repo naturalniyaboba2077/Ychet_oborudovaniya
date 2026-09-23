@@ -3,13 +3,15 @@ import { Link } from 'react-router'
 import { Copy, Loader2, QrCode, RefreshCw } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
+import { useCan } from '@/lib/rights'
 import { joinInviteUrl } from '@/lib/app-mode'
 import InviteQrBlock from '@/components/InviteQrBlock'
-import { INVITE_ROLES, INVITE_TTL_HOURS, firstUsableInvite, inviteExpiryLabel } from '@/lib/invite'
+import { INVITE_TTL_HOURS, inviteRolesFor, firstUsableInvite, inviteExpiryLabel } from '@/lib/invite'
 import type { InviteRole } from '@/lib/invite'
 
 export default function Invite() {
   const { workspace, workspaces } = useStore()
+  const inviteRoles = inviteRolesFor(useCan()('manageWorkspaces'))
   const utils = trpc.useUtils()
   const [url, setUrl] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
@@ -123,7 +125,7 @@ export default function Invite() {
               </div>
               <p className="break-all font-mono-num text-[13px] text-ink-500">{url}</p>
               <div className="flex flex-wrap items-center gap-2">
-                {INVITE_ROLES.map((r) => (
+                {inviteRoles.map((r) => (
                   <button
                     key={r.value}
                     type="button"

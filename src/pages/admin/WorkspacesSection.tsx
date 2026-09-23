@@ -3,9 +3,10 @@ import { motion } from 'framer-motion'
 import { Layers, Plus, QrCode } from 'lucide-react'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
+import { useCan } from '@/lib/rights'
 import { joinInviteUrl } from '@/lib/app-mode'
 import InviteQrBlock from '@/components/InviteQrBlock'
-import { INVITE_ROLES, INVITE_TTL_HOURS, firstUsableInvite, inviteExpiryLabel } from '@/lib/invite'
+import { INVITE_TTL_HOURS, inviteRolesFor, firstUsableInvite, inviteExpiryLabel } from '@/lib/invite'
 import type { InviteRole } from '@/lib/invite'
 import { cn } from '@/lib/utils'
 import type { WorkspaceDto } from './types'
@@ -381,6 +382,7 @@ function CreateWorkspaceModal({ open, onClose }: { open: boolean; onClose: () =>
 
 export default function WorkspacesSection() {
   const { workspace: storeWorkspace } = useStore()
+  const inviteRoles = inviteRolesFor(useCan()('manageWorkspaces'))
   const { data: workspaces, isLoading } = trpc.admin.workspaces.list.useQuery()
   const { data: users } = trpc.admin.users.list.useQuery({})
   const { data: items } = trpc.reports.allItems.useQuery({})
@@ -539,7 +541,7 @@ export default function WorkspacesSection() {
             </button>
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            {INVITE_ROLES.map((r) => (
+            {inviteRoles.map((r) => (
               <button
                 key={r.value}
                 type="button"

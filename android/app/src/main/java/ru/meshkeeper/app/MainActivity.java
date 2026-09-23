@@ -323,6 +323,14 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // Интерфейс обновляется сам, а оболочку проверяем тут: при запуске и
+        // при возвращении в приложение (не чаще раза в час, см. AppUpdater).
+        AppUpdater.check(this, serverOrigin);
+    }
+
+    @Override
     protected void onPause() {
         super.onPause();
         // Без этого cookie живут только в памяти: система убивает процесс, и

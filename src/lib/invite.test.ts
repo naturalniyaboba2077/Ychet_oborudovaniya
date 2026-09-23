@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { firstUsableInvite, inviteExpiryLabel } from "./invite";
+import { firstUsableInvite, inviteExpiryLabel, parseInviteToken } from "./invite";
 
 describe("firstUsableInvite", () => {
   it("skips expired and exhausted codes", () => {
@@ -38,5 +38,19 @@ describe("inviteExpiryLabel", () => {
 
   it("formats a real timestamp", () => {
     expect(inviteExpiryLabel("2026-09-02T10:00:00Z")).toContain("2026");
+  });
+});
+
+describe("parseInviteToken", () => {
+  it("takes the code from a link, a QR payload or as is", () => {
+    expect(parseInviteToken("https://mk.example/join?token=abc123XYZ&x=1")).toBe("abc123XYZ");
+    expect(parseInviteToken('{"t":"join","token":"qr-token-1"}')).toBe("qr-token-1");
+    expect(parseInviteToken("  plain-code-42 ")).toBe("plain-code-42");
+  });
+
+  it("rejects links and QR codes that carry no invite", () => {
+    expect(parseInviteToken("https://mk.example/tool/5")).toBe("");
+    expect(parseInviteToken('{"t":"tool","id":5}')).toBe("");
+    expect(parseInviteToken("   ")).toBe("");
   });
 });

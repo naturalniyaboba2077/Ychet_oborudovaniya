@@ -20,20 +20,22 @@ import {
 import { AnimatePresence, motion } from 'framer-motion'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
+import { useCan, type RightKey } from '@/lib/rights'
 
-const moreItems = [
-  { to: '/invite', label: 'Пригласить по QR', icon: QrCode },
-  { to: '/history', label: 'История', icon: History },
+const moreItems: Array<{ to: string; label: string; icon: typeof QrCode; rights?: RightKey[] }> = [
+  { to: '/invite', label: 'Пригласить по QR', icon: QrCode, rights: ['manageUsers'] },
+  { to: '/history', label: 'История', icon: History, rights: ['viewHistory'] },
   { to: '/chat', label: 'Чат группы', icon: MessageCircle },
-  { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck },
-  { to: '/reports', label: 'Отчёты', icon: BarChart3 },
-  { to: '/admin', label: 'Панель управления', icon: Settings2 },
+  { to: '/inventory', label: 'Инвентаризация', icon: ClipboardCheck, rights: ['inventory'] },
+  { to: '/reports', label: 'Отчёты', icon: BarChart3, rights: ['viewReports'] },
+  { to: '/admin', label: 'Панель управления', icon: Settings2, rights: ['manageUsers', 'manageWorkspaces', 'manageStorages', 'manageSites', 'manageDictionaries'] },
   { to: '/profile', label: 'Мой профиль', icon: UserRound },
 ]
 
 /** Мобильный каркас: верхняя панель 56px + нижняя навигация с FAB (design.md §5) */
 export default function MobileNav() {
   const { workspace, workspaces, setWorkspace, transfersToSend, transfersToReceive, unreadNotifications } = useStore()
+  const can = useCan()
   const [sheetOpen, setSheetOpen] = useState(false)
   const [wsOpen, setWsOpen] = useState(false)
   const navigate = useNavigate()
@@ -172,7 +174,7 @@ export default function MobileNav() {
                 </button>
               </div>
               <div className="grid grid-cols-2 gap-2">
-                {moreItems.map((item) => (
+                {moreItems.filter((item) => !item.rights || item.rights.some(can)).map((item) => (
                   <button
                     key={item.to}
                     onClick={() => {

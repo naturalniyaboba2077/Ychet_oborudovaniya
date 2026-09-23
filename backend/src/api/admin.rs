@@ -59,6 +59,64 @@ pub(crate) fn remove_workspace(conn: &Connection, input: &Value) -> ApiResult {
     Ok(json!({"ok": true}))
 }
 
+/// Создатель пространства. Отдельной колонки под него нет: создатель —
+/// тот, у кого есть `manageWorkspaces`. Это право выдаётся только при
+/// создании пространства и не передаётся (см. `check_rights_change`),
+/// так что оно и есть отметка «создал». Колонка с id не годилась бы ещё и
+/// потому, что id людей на разных узлах разные.
+pub(crate) fn is_owner(conn: &Connection, uid: i64, ws: i64) -> bool {
+    can_in_workspace(conn, uid, ws, "manageWorkspaces")
+}
+
+/// Администратор — тот, кто раздаёт права. У создателя это право тоже есть.
+pub(crate) fn is_admin(conn: &Connection, uid: i64, ws: i64) -> bool {
+    can_in_workspace(conn, uid, ws, "manageUsers")
+}
+
+/// Проверяет, может ли `actor` выставить `target` такие права.
+///
+/// Администратор раздаёт права сотрудникам, но:
+/// - назначить администратора (`manageUsers`) может только создатель;
+/// - права другого администратора, свои и создателя меняет только создатель —
+///   иначе администраторы снимали бы друг друга;
+/// - права создателя (`manageWorkspaces`) не выдаются и не отбираются никем:
+///   создатель один, и лишиться его пространство не должно.
+pub(crate) fn check_rights_change(
+    conn: &Connection,
+    actor: i64,
+    target: i64,
+    ws: i64,
+    rights: &Value,
+) -> Result<(), ApiError> {
+    let wants = |key: &str| rights.get(key).and_then(Value::as_bool).unwrap_or(false);
+    let target_owner = is_owner(conn, target, ws);
+    if wants("manageWorkspaces") != target_owner {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Права создателя пространства не передаются и не снимаются",
+        ));
+    }
+    if is_owner(conn, actor, ws) {
+        return Ok(());
+    }
+    if target_owner || is_admin(conn, target, ws) {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Права администраторов меняет только создатель пространства",
+        ));
+    }
+    if wants("manageUsers") {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Назначать администраторов может только создатель пространства",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let mut stmt = conn.prepare("SELECT user_id FROM user_workspaces WHERE workspace_id=?1")?;
@@ -66,9 +124,16 @@ pub(crate) fn admin_users(conn: &Connection, input: &Value) -> ApiResult {
         .query_map(params![ws], |r| r.get(0))?
         .filter_map(|x| x.ok())
         .collect();
+    // Права — те, что действуют в этой организации. Общее поле профиля
+    // хранит одно значение на все организации, и редактор прав открывался
+    // с ним, хотя сохранял уже права пространства.
     Ok(Value::Array(
         ids.into_iter()
-            .filter_map(|id| jsn::user_public(conn, id))
+            .filter_map(|id| {
+                let mut u = jsn::user_public(conn, id)?;
+                u["roleRights"] = merged_rights(conn, id, ws);
+                Some(u)
+            })
             .collect(),
     ))
 }
@@ -99,11 +164,38 @@ pub(crate) fn admin_user_update(conn: &Connection, input: &Value, actor: Option<
         require_can_in_workspace(conn, uid, ws, "manageUsers")?;
     }
     let id = i64v(input, "id").ok_or_else(|| ApiError::bad("id"))?;
+    // Блокировка и правка карточки — то же распоряжение человеком, что и
+    // права: создателя не трогает никто, администратора — только создатель.
+    if let Some(uid) = actor {
+        let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+        let touches_card = ["fullName", "position", "phone", "status"]
+            .iter()
+            .any(|k| input.get(*k).is_some_and(|v| !v.is_null()));
+        if touches_card && id != uid {
+            if is_owner(conn, id, ws) {
+                return Err(ApiError::new(
+                    "FORBIDDEN",
+                    403,
+                    "Карточку создателя пространства меняет только он сам",
+                ));
+            }
+            if is_admin(conn, id, ws) && !is_owner(conn, uid, ws) {
+                return Err(ApiError::new(
+                    "FORBIDDEN",
+                    403,
+                    "Администратора блокирует и правит только создатель пространства",
+                ));
+            }
+        }
+    }
     conn.execute("UPDATE users SET full_name=COALESCE(?2,full_name), position=COALESCE(?3,position), phone=COALESCE(?4,phone), status=COALESCE(?5,status) WHERE id=?1",
         params![id, s(input,"fullName"), s(input,"position"), s(input,"phone"), s(input,"status")])?;
     if let Some(rr) = input.get("roleRights") {
         if !rr.is_null() {
             let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+            if let Some(uid) = actor {
+                check_rights_change(conn, uid, id, ws, rr)?;
+            }
             conn.execute(
                 "UPDATE user_workspaces SET rights_json=?1 WHERE user_id=?2 AND workspace_id=?3",
                 params![rr.to_string(), id, ws],
@@ -219,6 +311,17 @@ pub(crate) fn admin_user_remove(conn: &Connection, input: &Value, actor: Option<
         |r| r.get(0),
     )?;
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
+    // Создателя не исключает никто, администратора — только создатель.
+    if is_owner(conn, id, ws) {
+        return Err(ApiError::new("FORBIDDEN", 403, "Создателя пространства исключить нельзя"));
+    }
+    if is_admin(conn, id, ws) && !is_owner(conn, uid, ws) {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Исключить администратора может только создатель пространства",
+        ));
+    }
     conn.execute(
         "DELETE FROM user_workspaces WHERE user_id=?1 AND workspace_id=?2",
         params![id, ws],
@@ -325,6 +428,27 @@ pub(crate) fn ws_create_invite(
     let ws = i64v(input, "workspaceId").unwrap_or_else(|| ws_fallback(conn));
     let token = Uuid::new_v4().to_string().replace('-', "");
     let role = s(input, "role").unwrap_or_else(|| "member".into());
+    // Приглашение — тот же способ выдать права, поэтому правила те же:
+    // администраторов зовёт только создатель, а второго создателя не
+    // бывает вовсе.
+    let rights = db::rights_for_role(&role);
+    if rights["manageWorkspaces"].as_bool() == Some(true) {
+        return Err(ApiError::new(
+            "FORBIDDEN",
+            403,
+            "Пригласить создателем нельзя — создатель у пространства один",
+        ));
+    }
+    if rights["manageUsers"].as_bool() == Some(true) {
+        let is_creator = user_id.is_some_and(|uid| is_owner(conn, uid, ws));
+        if !is_creator {
+            return Err(ApiError::new(
+                "FORBIDDEN",
+                403,
+                "Приглашать администраторов может только создатель пространства",
+            ));
+        }
+    }
     let expires_at = invite_expiry(input);
     conn.execute(
         "INSERT INTO invites (workspace_id, token, role, created_by, max_uses, expires_at, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",

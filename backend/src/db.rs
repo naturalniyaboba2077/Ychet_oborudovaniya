@@ -323,11 +323,15 @@ pub fn viewer_rights() -> serde_json::Value {
 
 /// Права администратора: каталог, заявки, инвентаризация и справочники,
 /// но без управления участниками и пространствами (ТЗ, роль «Администратор»).
+/// Администратор раздаёт права сотрудникам (`manageUsers`), но не
+/// распоряжается самим пространством (`manageWorkspaces`) — это право
+/// одного создателя. Назначать и снимать администраторов тоже может только
+/// создатель, см. `admin::check_rights_change`.
 pub fn admin_rights() -> serde_json::Value {
     serde_json::json!({
         "viewItems": true, "createItems": true, "editItems": true, "deleteItems": true,
         "transferItems": true, "acceptTransfers": true, "writeOff": true, "replenish": true,
-        "inventory": true, "viewHistory": true, "viewReports": true, "manageUsers": false,
+        "inventory": true, "viewHistory": true, "viewReports": true, "manageUsers": true,
         "manageWorkspaces": false, "manageStorages": true, "manageSites": true, "manageDictionaries": true,
         "reportFaults": true, "requestChanges": true,
         "viewPhotos": true, "viewLocation": true,

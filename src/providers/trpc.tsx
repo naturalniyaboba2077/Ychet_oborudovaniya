@@ -5,6 +5,7 @@ import superjson from "superjson";
 import type { AppRouter } from "../../api/router";
 import type { ReactNode } from "react";
 import { trpcUrl } from "@/lib/app-mode";
+import { activeWorkspaceId } from "@/lib/active-workspace";
 
 export const trpc = createTRPCReact<AppRouter>();
 
@@ -14,6 +15,10 @@ const trpcClient = trpc.createClient({
     httpBatchLink({
       url: trpcUrl(),
       transformer: superjson,
+      headers() {
+        const ws = activeWorkspaceId();
+        return ws ? { "x-mk-workspace": String(ws) } : {};
+      },
       fetch(input, init) {
         return globalThis.fetch(input, {
           ...(init ?? {}),

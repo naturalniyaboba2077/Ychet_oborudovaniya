@@ -1,4 +1,5 @@
 mod api;
+mod apk;
 mod auth;
 mod db;
 mod google;
@@ -795,6 +796,12 @@ async fn main() {
         .route("/files/{name}", get(serve_attachment))
         .route("/api/trpc/{*procedures}", any(trpc))
         .merge(update::routes(frontend))
+        // Новые версии Android-приложения — см. apk.rs.
+        .merge(apk::routes(
+            std::env::var("MESHKEEPER_APK_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| dir.join("apk")),
+        ))
         // Предел на размер запроса. Без него любой желающий заливает сколько
         // угодно: тело читается в память целиком, а снимки теперь ещё и
         // ложатся на диск. Двадцать мегабайт — с запасом на карточку с

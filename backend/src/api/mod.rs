@@ -489,6 +489,14 @@ fn status_change_reason(
 fn required_admin_right(procedure: &str) -> Option<&'static str> {
     if procedure.starts_with("admin.users.") {
         Some("manageUsers")
+    } else if matches!(
+        procedure,
+        "admin.workspaces.createInvite" | "admin.workspaces.invites"
+    ) {
+        // Приглашать людей — часть работы администратора, а не только
+        // создателя. Какую роль можно выдать приглашением, решает
+        // ws_create_invite.
+        Some("manageUsers")
     } else if procedure.starts_with("admin.workspaces.") {
         Some("manageWorkspaces")
     } else if procedure.starts_with("admin.storages.") {
@@ -1590,6 +1598,73 @@ mod tests {
             )
             .unwrap();
         assert_eq!(holder, None);
+        cleanup(conn, path);
+    }
+
+    /// Администратор раздаёт права, но администраторов назначает только
+    /// создатель, и права самого создателя не трогает никто.
+    #[test]
+    fn only_the_creator_appoints_admins() {
+        let (mut conn, path, users, ws) = test_db();
+        let [owner, admin, worker] = users;
+        let set = |conn: &mut Connection, actor: i64, id: i64, rights: Value| {
+            dispatch(
+                conn,
+                "admin.users.update",
+                &json!({"id": id, "workspaceId": ws, "roleRights": rights}),
+                Some(actor),
+            )
+        };
+        let with = |base: Value, key: &str, on: bool| {
+            let mut r = base;
+            r[key] = json!(on);
+            r
+        };
+
+        // Создатель назначает администратора.
+        set(&mut conn, owner, admin, db::admin_rights()).unwrap();
+
+        // Администратор раздаёт сотруднику права…
+        set(&mut conn, admin, worker, with(db::default_rights(), "writeOff", true)).unwrap();
+        // …но не делает его администратором.
+        let e = set(&mut conn, admin, worker, with(db::default_rights(), "manageUsers", true)).unwrap_err();
+        assert_eq!(e.http, 403);
+        // Права создателя и свои собственные администратор не меняет.
+        assert_eq!(set(&mut conn, admin, owner, db::owner_rights()).unwrap_err().http, 403);
+        assert_eq!(set(&mut conn, admin, admin, db::owner_rights()).unwrap_err().http, 403);
+        assert_eq!(
+            set(&mut conn, admin, admin, with(db::admin_rights(), "manageUsers", false)).unwrap_err().http,
+            403
+        );
+        // Права создателя не передаются и не снимаются — даже им самим.
+        assert_eq!(set(&mut conn, owner, worker, db::owner_rights()).unwrap_err().http, 403);
+        assert_eq!(set(&mut conn, owner, owner, db::admin_rights()).unwrap_err().http, 403);
+
+        // Приглашения: сотрудника зовёт и администратор, администратора —
+        // только создатель, создателя — никто.
+        let invite = |conn: &mut Connection, actor: i64, role: &str| {
+            dispatch(
+                conn,
+                "admin.workspaces.createInvite",
+                &json!({"workspaceId": ws, "role": role}),
+                Some(actor),
+            )
+        };
+        invite(&mut conn, admin, "member").unwrap();
+        assert_eq!(invite(&mut conn, admin, "admin").unwrap_err().http, 403);
+        invite(&mut conn, owner, "admin").unwrap();
+        assert_eq!(invite(&mut conn, owner, "owner").unwrap_err().http, 403);
+
+        // Второго администратора первый не трогает и не исключает.
+        set(&mut conn, owner, worker, db::admin_rights()).unwrap();
+        assert_eq!(set(&mut conn, admin, worker, db::default_rights()).unwrap_err().http, 403);
+        let remove = |conn: &mut Connection, actor: i64, id: i64| {
+            dispatch(conn, "admin.users.remove", &json!({"id": id, "workspaceId": ws}), Some(actor))
+        };
+        assert_eq!(remove(&mut conn, admin, worker).unwrap_err().http, 403);
+        assert_eq!(remove(&mut conn, admin, owner).unwrap_err().http, 403);
+        // Создатель снимает администратора обратно в сотрудники.
+        set(&mut conn, owner, worker, db::default_rights()).unwrap();
         cleanup(conn, path);
     }
 

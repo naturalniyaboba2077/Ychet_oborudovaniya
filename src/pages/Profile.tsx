@@ -9,6 +9,7 @@ import {
   EyeOff,
   AlertTriangle,
   Plus,
+  UserPlus,
   Check,
   ChevronDown,
   Loader2,
@@ -19,6 +20,8 @@ import { cn } from '@/lib/utils'
 import { trpc } from '@/providers/trpc'
 import { useStore } from '@/lib/store'
 import type { Rights } from '@/lib/rights'
+import { inviteRoleLabel, parseInviteToken } from '@/lib/invite'
+import QrScanner from '@/components/QrScanner'
 // mock-данные только как запасной экран, если API ещё не ответил
 import type { inferRouterOutputs } from '@trpc/server'
 import type { AppRouter } from '../../api/router'
@@ -72,8 +75,8 @@ function adaptProfile(p: ApiProfile): VProfile {
  */
 function workspaceRole(rights: Rights | null | undefined): string {
   if (!rights) return 'Участник'
-  if (rights.manageUsers && rights.manageWorkspaces) return 'Владелец'
-  if (rights.manageUsers) return 'Руководитель'
+  if (rights.manageWorkspaces) return 'Создатель'
+  if (rights.manageUsers) return 'Администратор'
   if (rights.writeOff || rights.replenish || rights.inventory) return 'Кладовщик'
   if (rights.createItems || rights.editItems) return 'Мастер'
   if (rights.transferItems) return 'Работник'
@@ -356,6 +359,13 @@ export default function Profile() {
 
   const deleteAccountM = trpc.profile.deleteAccount.useMutation()
 
+  const joinWsM = trpc.auth.join.useMutation({
+    onSuccess: () => {
+      utils.profile.get.invalidate()
+      utils.meta.workspaces.invalidate()
+    },
+  })
+
   const createWsM = trpc.admin.workspaces.create.useMutation({
     onSuccess: () => {
       utils.profile.get.invalidate()
@@ -394,6 +404,16 @@ export default function Profile() {
 
   const [logoutOpen, setLogoutOpen] = useState(false)
   const [createWsOpen, setCreateWsOpen] = useState(false)
+  const [joinWsOpen, setJoinWsOpen] = useState(false)
+  const [joinLink, setJoinLink] = useState('')
+  const [joinScan, setJoinScan] = useState(false)
+  const joinToken = parseInviteToken(joinLink)
+  // До вступления показываем, куда и кем человек войдёт: приглашение может
+  // быть и от чужой организации, и на роль администратора.
+  const joinInfo = trpc.auth.inviteInfo.useQuery(
+    { token: joinToken },
+    { enabled: joinWsOpen && joinToken.length >= 8, retry: false }
+  )
   const [wsName, setWsName] = useState('')
   const [wsTz, setWsTz] = useState('Europe/Moscow')
   const [wsPrefix, setWsPrefix] = useState('ВН-')
@@ -505,6 +525,45 @@ export default function Profile() {
     setCreateWsOpen(false)
     setWsName('')
     setWsPrefix('ВН-')
+  }
+
+  // Принимает ссылку-приглашение, код из неё и QR: ссылку пересылают в
+  // мессенджере, код диктуют, QR показывают с экрана администратора.
+  const onJoinWorkspace = (token = joinToken) => {
+    if (!token) {
+      showToast('Вставьте ссылку-приглашение или код из неё', true)
+      return
+    }
+    joinWsM.mutate(
+      { token },
+      {
+        onSuccess: (ws) => {
+          showToast(ws?.name ? `Вы присоединились к «${ws.name}»` : 'Вы присоединились к пространству')
+          // Вступали, чтобы работать там, — сразу туда и переключаем.
+          if (ws?.id) {
+            setWorkspace({ id: Number(ws.id), name: ws.name, internalIdPrefix: ws.internalIdPrefix })
+          }
+          closeJoin()
+        },
+        onError: (e) => showToast(e.message || 'Не удалось присоединиться', true),
+      }
+    )
+  }
+
+  const closeJoin = () => {
+    setJoinWsOpen(false)
+    setJoinScan(false)
+    setJoinLink('')
+  }
+
+  const onJoinScanned = (code: string) => {
+    const token = parseInviteToken(code)
+    if (!token) {
+      showToast('Это не QR-приглашение в организацию', true)
+      return
+    }
+    setJoinScan(false)
+    setJoinLink(token)
   }
 
   const onLeaveWorkspace = () => {
@@ -845,7 +904,7 @@ export default function Profile() {
             <div className="space-y-2.5">
               <AnimatePresence initial={false}>
                 {allWorkspaces.map((ws) => {
-                  const isCurrent = ws.name === workspace?.name
+                  const isCurrent = Number(ws.id) === workspace?.id
                   const role = workspaceRole(ws.rights)
                   return (
                     <motion.div
@@ -897,8 +956,19 @@ export default function Profile() {
               className="mt-4 inline-flex items-center gap-2 h-10 px-5 rounded-xl border border-brand-100 bg-white text-sm font-semibold text-ink-900 hover:bg-brand-50 transition"
             >
               <Plus size={16} />
-              Создать новое пространство
+              Создать своё пространство
             </button>
+            <button
+              onClick={() => setJoinWsOpen(true)}
+              className="mt-4 ml-0 sm:ml-3 inline-flex items-center gap-2 h-10 px-5 rounded-xl border border-brand-100 bg-white text-sm font-semibold text-ink-900 hover:bg-brand-50 transition"
+            >
+              <UserPlus size={16} />
+              Вступить в существующее
+            </button>
+            <p className="mt-3 text-xs leading-5 text-ink-500">
+              В своём пространстве вы администратор. В чужое вступают по приглашению его
+              администратора — обычно сотрудником, с теми правами, что выдал он.
+            </p>
           </Card>
 
           {/* Секция 5. Настройки */}
@@ -1073,6 +1143,65 @@ export default function Profile() {
           >
             {createWsM.isPending && <Loader2 size={16} className="animate-spin" />}
             Создать
+          </button>
+        </div>
+      </Modal>
+
+      {/* Вступление в пространство по приглашению */}
+      <Modal open={joinWsOpen} onClose={closeJoin} title="Вступить в пространство">
+        <label className="block">
+          <span className={labelCls}>
+            Ссылка-приглашение или код <span className="text-accent">*</span>
+          </span>
+          <input
+            value={joinLink}
+            onChange={(e) => setJoinLink(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && onJoinWorkspace()}
+            placeholder="https://…/join?token=…"
+            autoFocus
+            className={inputCls}
+          />
+        </label>
+        {joinScan ? (
+          <div className="mt-3">
+            <QrScanner onCode={onJoinScanned} />
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setJoinScan(true)}
+            className="mt-2 text-sm font-semibold text-brand-600 hover:underline"
+          >
+            Отсканировать QR-приглашение
+          </button>
+        )}
+        {joinInfo.data && (
+          <div className="mt-3 rounded-xl border border-brand-100 bg-brand-50/60 px-4 py-3 text-sm">
+            <span className="block font-semibold text-ink-900">{joinInfo.data.workspace?.name}</span>
+            <span className="block text-ink-500">Вы войдёте как: {inviteRoleLabel(joinInfo.data.role)}</span>
+          </div>
+        )}
+        {joinInfo.error && (
+          <p className="mt-3 text-sm text-danger">{joinInfo.error.message}</p>
+        )}
+        <p className="mt-2 text-xs leading-5 text-ink-500">
+          Приглашение выдаёт администратор организации. Права в ней будут свои — то, что
+          вы можете в текущем пространстве, туда не переносится.
+        </p>
+        <div className="mt-5 flex justify-end gap-3">
+          <button
+            onClick={closeJoin}
+            className="h-10 px-4 rounded-xl text-sm font-semibold text-brand-600 hover:bg-brand-50 transition-colors"
+          >
+            Отмена
+          </button>
+          <button
+            onClick={() => onJoinWorkspace()}
+            disabled={joinWsM.isPending || !joinToken || joinInfo.isError}
+            className="inline-flex items-center gap-2 h-10 px-5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover active:scale-[0.97] transition disabled:opacity-70"
+          >
+            {joinWsM.isPending && <Loader2 size={16} className="animate-spin" />}
+            Присоединиться
           </button>
         </div>
       </Modal>

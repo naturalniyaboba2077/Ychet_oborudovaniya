@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router'
 import { Search, Bell, ChevronDown, Check, X, QrCode, Plus } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useStore } from '@/lib/store'
+import { useCan } from '@/lib/rights'
 
 export default function TopBar() {
   const {
@@ -14,6 +15,7 @@ export default function TopBar() {
     unreadNotifications,
     currentUser,
   } = useStore()
+  const can = useCan()
   const navigate = useNavigate()
   const [wsOpen, setWsOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -101,13 +103,15 @@ export default function TopBar() {
 
       <div className="flex-1" />
 
-      <Link
-        to="/invite"
-        className="inline-flex items-center gap-1.5 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-semibold text-white hover:bg-accent-hover"
-      >
-        <QrCode size={16} strokeWidth={2} />
-        Пригласить
-      </Link>
+      {can('manageUsers') && (
+        <Link
+          to="/invite"
+          className="inline-flex items-center gap-1.5 rounded-xl bg-accent px-3.5 py-2 text-[13px] font-semibold text-white hover:bg-accent-hover"
+        >
+          <QrCode size={16} strokeWidth={2} />
+          Пригласить
+        </Link>
+      )}
 
       {/* Плашка передач */}
       <Link

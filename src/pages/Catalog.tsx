@@ -701,13 +701,15 @@ export default function Catalog() {
           transition={{ duration: 0.28, delay: 0.05, ease: [0.22, 1, 0.36, 1] }}
           className="flex flex-wrap items-center gap-2"
         >
-          <Link
-            to="/invite"
-            className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
-          >
-            <QrCode size={16} strokeWidth={2.25} />
-            Пригласить по QR
-          </Link>
+          {can('manageUsers') && (
+            <Link
+              to="/invite"
+              className="inline-flex items-center gap-2 h-10 px-4 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent-hover hover:-translate-y-px active:scale-[0.97] transition"
+            >
+              <QrCode size={16} strokeWidth={2.25} />
+              Пригласить по QR
+            </Link>
+          )}
           <button
             onClick={() => navigate('/scan')}
             className="inline-flex items-center gap-2 h-10 px-4 rounded-xl border border-brand-100 bg-white text-sm font-semibold text-ink-900 hover:bg-brand-50 transition"
@@ -715,13 +717,15 @@ export default function Catalog() {
             <QrCode size={16} strokeWidth={2.25} />
             Сканировать QR
           </button>
-          <Link
-            to="/create"
-            className="inline-flex items-center gap-2 h-10 px-5 rounded-xl border border-brand-100 bg-white text-sm font-semibold text-ink-900 hover:bg-brand-50 transition"
-          >
-            <Plus size={16} strokeWidth={2.25} />
-            Создать инструмент
-          </Link>
+          {can('createItems') && (
+            <Link
+              to="/create"
+              className="inline-flex items-center gap-2 h-10 px-5 rounded-xl border border-brand-100 bg-white text-sm font-semibold text-ink-900 hover:bg-brand-50 transition"
+            >
+              <Plus size={16} strokeWidth={2.25} />
+              Создать инструмент
+            </Link>
+          )}
         </motion.div>
       </div>
 
