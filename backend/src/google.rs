@@ -67,6 +67,10 @@ pub struct Pending {
     /// Кто просил привязать Google к своей карточке. Заполняется, только
     /// когда запрос пришёл с живой сессией, — это и есть доказательство прав.
     pub link_user_id: Option<i64>,
+    /// SHA-256 секрета приложения, если вход начат из Android-приложения.
+    /// Тогда сессия не ставится в cookie браузера, а передаётся приложению
+    /// одноразовым кодом (см. `mark_app`, `issue_handoff`).
+    pub app_challenge: Option<String>,
 }
 
 fn now() -> String {
@@ -125,7 +129,8 @@ pub fn begin(
 pub fn take_pending(conn: &Connection, state: &str) -> Option<Pending> {
     let row = conn
         .query_row(
-            "SELECT invite_token, phone, full_name, link_user_id, created_at FROM google_pending WHERE state=?1",
+            "SELECT invite_token, phone, full_name, link_user_id, created_at, app_challenge
+             FROM google_pending WHERE state=?1",
             params![state],
             |r| {
                 Ok((
@@ -134,6 +139,7 @@ pub fn take_pending(conn: &Connection, state: &str) -> Option<Pending> {
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<i64>>(3)?,
                     r.get::<_, String>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                 ))
             },
         )
@@ -150,7 +156,81 @@ pub fn take_pending(conn: &Connection, state: &str) -> Option<Pending> {
         phone: row.1,
         full_name: row.2,
         link_user_id: row.3,
+        app_challenge: row.5,
     })
+}
+
+/// Сколько живёт код передачи сессии из браузера в приложение: только на
+/// переход «браузер → приложение», дольше ему быть незачем.
+const HANDOFF_TTL_SECS: i64 = 300;
+
+fn sha256_hex(raw: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(raw.as_bytes()))
+}
+
+fn is_hex64(v: &str) -> bool {
+    v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Помечает попытку входа как начатую в Android-приложении.
+///
+/// Google не пускает вход во встроенном WebView (ошибка 403
+/// disallowed_useragent), поэтому приложение перехватывает переход на
+/// Google и открывает его в настоящем браузере. Но cookie, которую выдаст
+/// callback, достанется браузеру, а не приложению. Поэтому приложение
+/// заранее присылает сюда `state` попытки и хэш своего одноразового
+/// секрета — по схеме PKCE. Код, который потом уйдёт в приложение через
+/// ссылку, без самого секрета ничего не даст: перехватить ссылку мало.
+///
+/// Пометить можно только ещё не помеченную живую попытку: `state` знает
+/// лишь тот, кто её начал.
+pub fn mark_app(conn: &Connection, state: &str, challenge: &str) -> Result<bool> {
+    if !is_hex64(challenge) {
+        return Err(anyhow!("неверный challenge"));
+    }
+    let edge = chrono::Utc::now() - chrono::Duration::seconds(PENDING_TTL_SECS);
+    let n = conn.execute(
+        "UPDATE google_pending SET app_challenge=?2
+         WHERE state=?1 AND app_challenge IS NULL AND created_at >= ?3",
+        params![state, challenge.to_ascii_lowercase(), edge.to_rfc3339()],
+    )?;
+    Ok(n == 1)
+}
+
+/// Выдаёт одноразовый код, по которому приложение заберёт сессию.
+pub fn issue_handoff(conn: &Connection, user_id: i64, challenge: &str) -> Result<String> {
+    let code = random_state();
+    let edge = chrono::Utc::now() - chrono::Duration::seconds(HANDOFF_TTL_SECS);
+    let _ = conn.execute(
+        "DELETE FROM google_handoff WHERE created_at < ?1",
+        params![edge.to_rfc3339()],
+    );
+    conn.execute(
+        "INSERT INTO google_handoff (code, user_id, challenge, created_at) VALUES (?1,?2,?3,?4)",
+        params![code, user_id, challenge, now()],
+    )?;
+    Ok(code)
+}
+
+/// Меняет код на пользователя, если приложение предъявило свой секрет.
+/// Код одноразовый: удаляется при любой попытке, даже неудачной.
+pub fn redeem_handoff(conn: &Connection, code: &str, verifier: &str) -> Option<i64> {
+    let row = conn
+        .query_row(
+            "SELECT user_id, challenge, created_at FROM google_handoff WHERE code=?1",
+            params![code],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+        )
+        .optional()
+        .ok()
+        .flatten()?;
+    let _ = conn.execute("DELETE FROM google_handoff WHERE code=?1", params![code]);
+    let created = chrono::DateTime::parse_from_rfc3339(&row.2).ok()?;
+    if (chrono::Utc::now() - created.with_timezone(&chrono::Utc)).num_seconds() > HANDOFF_TTL_SECS {
+        return None;
+    }
+    (sha256_hex(verifier) == row.1).then_some(row.0)
 }
 
 /// Чистит брошенные попытки — человек мог закрыть вкладку на экране Google.
@@ -270,6 +350,35 @@ mod tests {
     fn rejects_token_without_sub() {
         let t = token(serde_json::json!({"email": "a@b.c", "email_verified": true}));
         assert!(identity_from_id_token(&t).is_err());
+    }
+
+    #[test]
+    fn app_handoff_needs_verifier_and_is_single_use() {
+        let path = std::env::temp_dir().join(format!("mk-google-{}.db", uuid::Uuid::new_v4()));
+        let conn = crate::db::open(&path).unwrap();
+        // begin без настроек Google откажет — заводим попытку напрямую.
+        conn.execute(
+            "INSERT INTO google_pending (state, created_at) VALUES ('st', ?1)",
+            params![now()],
+        )
+        .unwrap();
+        let verifier = "секрет-приложения";
+        let challenge = sha256_hex(verifier);
+        assert!(mark_app(&conn, "st", "не-хэш").is_err());
+        assert!(!mark_app(&conn, "нет-такой", &challenge).unwrap());
+        assert!(mark_app(&conn, "st", &challenge).unwrap());
+        // Повторно пометить (подменить секрет) нельзя.
+        assert!(!mark_app(&conn, "st", &sha256_hex("чужой")).unwrap());
+        let pending = take_pending(&conn, "st").unwrap();
+        assert_eq!(pending.app_challenge.as_deref(), Some(challenge.as_str()));
+
+        let code = issue_handoff(&conn, 7, &challenge).unwrap();
+        assert_eq!(redeem_handoff(&conn, &code, "чужой"), None);
+        // Неудачная попытка код сжигает.
+        assert_eq!(redeem_handoff(&conn, &code, verifier), None);
+        let code = issue_handoff(&conn, 7, &challenge).unwrap();
+        assert_eq!(redeem_handoff(&conn, &code, verifier), Some(7));
+        assert_eq!(redeem_handoff(&conn, &code, verifier), None);
     }
 
     #[test]

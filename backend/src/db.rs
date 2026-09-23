@@ -287,6 +287,22 @@ fn migrate(conn: &Connection) -> Result<()> {
         );
         "#,
     );
+    // Вход через Google из Android-приложения идёт во внешнем браузере
+    // (WebView Google не пускает), и сессию надо передать обратно в
+    // приложение. Попытка помечается хэшем секрета приложения, а после
+    // входа выдаётся одноразовый код, который обменивается на сессию только
+    // вместе с этим секретом — см. google.rs. Стоит после CREATE TABLE
+    // google_pending выше, иначе на новой базе столбец добавлять некуда.
+    let _ = conn.execute("ALTER TABLE google_pending ADD COLUMN app_challenge TEXT", []);
+    let _ = conn.execute(
+        "CREATE TABLE IF NOT EXISTS google_handoff (
+           code TEXT PRIMARY KEY,
+           user_id INTEGER NOT NULL,
+           challenge TEXT NOT NULL,
+           created_at TEXT NOT NULL
+         )",
+        [],
+    );
     Ok(())
 }
 

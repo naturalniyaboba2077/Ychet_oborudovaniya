@@ -128,10 +128,13 @@ public class MainActivity extends AppCompatActivity {
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
                 Uri target = request.getUrl();
                 if (isTrustedLocalOrigin(target)) return false;
-                // Вход через Google должен идти внутри приложения. Если
-                // отправить его во внешний браузер, сессия достанется браузеру:
-                // cookie лягут туда, а приложение останется незалогиненным.
-                if (isGoogleSignIn(target)) return false;
+                // Вход через Google — в настоящем браузере: во встроенном
+                // WebView Google его не пускает (403 disallowed_useragent).
+                // Сессию потом вернёт в приложение GoogleSignIn.
+                if (GoogleSignIn.isAuthStart(target)) {
+                    GoogleSignIn.start(MainActivity.this, serverOrigin, target);
+                    return true;
+                }
                 if ("https".equalsIgnoreCase(target.getScheme())) {
                     try {
                         startActivity(new Intent(Intent.ACTION_VIEW, target));
@@ -202,6 +205,8 @@ public class MainActivity extends AppCompatActivity {
         if (!savedRelay.isEmpty()) {
             loadHome();
         }
+        // Процесс мог быть убит, пока человек входил через Google в браузере.
+        handleGoogleReturn(getIntent());
 
         showSetupHint();
         askNotify();
@@ -323,6 +328,26 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleGoogleReturn(intent);
+    }
+
+    /** Возвращение из браузера после входа через Google — см. GoogleSignIn. */
+    private void handleGoogleReturn(Intent intent) {
+        if (intent == null || !GoogleSignIn.isReturn(intent.getData())) return;
+        String finish = GoogleSignIn.finishUrl(this, intent.getData());
+        // Ссылку обрабатываем один раз: при повороте экрана или
+        // пересоздании активности она не должна сработать снова.
+        intent.setData(null);
+        if (finish == null) return;
+        setup.setVisibility(View.GONE);
+        web.setVisibility(View.VISIBLE);
+        web.loadUrl(finish);
+    }
+
+    @Override
     protected void onResume() {
         super.onResume();
         // Интерфейс обновляется сам, а оболочку проверяем тут: при запуске и
@@ -378,25 +403,6 @@ public class MainActivity extends AppCompatActivity {
      * клиентом сервера. Проверка осталась строгой: схема, хост и порт должны
      * совпасть, всё остальное уходит во внешний браузер.
      */
-    /**
-     * Страницы входа Google, которым разрешено открываться внутри приложения.
-     *
-     * Список узкий намеренно: это исключение из правила «чужое — во внешний
-     * браузер», и расширять его на весь google.com нельзя — тогда любая
-     * ссылка на сервисы Google открывалась бы внутри учётной программы.
-     */
-    private boolean isGoogleSignIn(Uri uri) {
-        if (uri == null || !"https".equalsIgnoreCase(uri.getScheme())) return false;
-        String host = uri.getHost();
-        if (host == null) return false;
-        host = host.toLowerCase(java.util.Locale.ROOT);
-        return host.equals("accounts.google.com")
-                || host.equals("accounts.youtube.com")
-                || host.equals("myaccount.google.com")
-                || host.endsWith(".gstatic.com")
-                || host.equals("ssl.gstatic.com");
-    }
-
     private boolean isTrustedLocalOrigin(Uri uri) {
         if (uri == null || serverOrigin.isEmpty()) return false;
         Uri trusted = Uri.parse(serverOrigin);

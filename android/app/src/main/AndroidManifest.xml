@@ -26,10 +26,20 @@
             android:exported="true"
             android:hardwareAccelerated="true"
             android:configChanges="orientation|screenSize|keyboardHidden"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Возвращение из браузера после входа через Google (GoogleSignIn).
+                 singleTask — чтобы вернуться в ту же активность и закрыть
+                 вкладку браузера поверх неё, а не открыть вторую копию. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="ru.meshkeeper.app" android:host="google" />
             </intent-filter>
         </activity>
         <service

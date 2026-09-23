@@ -266,9 +266,11 @@ async fn google_callback(
     Query(q): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     if let Some(error) = q.get("error") {
+        google_log(Err(&format!("Google отказал: {error}")));
         return google_page(None, &format!("Google отказал: {error}"));
     }
     let (Some(code), Some(oauth_state)) = (q.get("code"), q.get("state")) else {
+        google_log(Err("неполный ответ Google"));
         return google_page(None, "Google вернул неполный ответ");
     };
     // Замок держим только на время работы с базой: обмен кода ходит в сеть,
@@ -278,24 +280,130 @@ async fn google_callback(
         google::take_pending(&conn, oauth_state)
     };
     let Some(pending) = pending else {
+        google_log(Err("попытка не найдена или устарела"));
         return google_page(None, "Ссылка устарела, попробуйте войти заново");
     };
+    let app = pending.app_challenge.clone();
     let identity = match google::exchange(code).await {
         Ok(v) => v,
-        Err(e) => return google_page(None, &format!("Не удалось проверить аккаунт: {e}")),
-    };
-    let issued = {
-        let conn = state.db.lock();
-        match api::google_finish(&conn, &identity, &pending) {
-            Ok(uid) => auth::create_session(&conn, uid)
-                .map_err(|e| api::ApiError::internal(format!("Не удалось создать сессию: {e}"))),
-            Err(e) => Err(e),
+        Err(e) => {
+            let msg = format!("Не удалось проверить аккаунт: {e}");
+            google_log(Err(&msg));
+            return google_fail(app.is_some(), &msg);
         }
     };
-    match issued {
-        Ok(token) => google_page(Some(&token), ""),
-        Err(e) => google_page(None, &e.message),
+    let conn = state.db.lock();
+    let uid = match api::google_finish(&conn, &identity, &pending) {
+        Ok(uid) => uid,
+        Err(e) => {
+            google_log(Err(&e.message));
+            return google_fail(app.is_some(), &e.message);
+        }
+    };
+    google_log(Ok(uid));
+    // Вход из приложения: сессию получит приложение, а не этот браузер.
+    if let Some(challenge) = app {
+        return match google::issue_handoff(&conn, uid, &challenge) {
+            Ok(code) => google_app_page(Some(&code), ""),
+            Err(e) => google_app_page(None, &format!("Не удалось передать вход в приложение: {e}")),
+        };
     }
+    match auth::create_session(&conn, uid) {
+        Ok(token) => google_page(Some(&token), ""),
+        Err(e) => google_page(None, &format!("Не удалось создать сессию: {e}")),
+    }
+}
+
+/// Без этой строки в журнале отказ входа через Google не виден вовсе:
+/// callback идёт мимо tRPC и его общего журнала.
+fn google_log(result: Result<i64, &str>) {
+    let ts = chrono::Utc::now().to_rfc3339();
+    match result {
+        Ok(uid) => eprintln!("{ts} ok google.callback user:{uid}"),
+        // Ответ Google многострочный — в журнал одной строкой.
+        Err(e) => eprintln!(
+            "{ts} ОТКАЗ google.callback аноним {}",
+            e.split_whitespace().collect::<Vec<_>>().join(" ")
+        ),
+    }
+}
+
+fn google_fail(app: bool, error: &str) -> axum::response::Response {
+    if app {
+        google_app_page(None, error)
+    } else {
+        google_page(None, error)
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct GoogleAppMark {
+    state: String,
+    challenge: String,
+}
+
+/// Приложение помечает попытку входа своей перед уходом во внешний браузер
+/// (см. google::mark_app). Cookie тут не участвуют — вызывает Java-код.
+async fn google_app_mark(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<GoogleAppMark>,
+) -> StatusCode {
+    let conn = state.db.lock();
+    match google::mark_app(&conn, &body.state, &body.challenge) {
+        Ok(true) => StatusCode::NO_CONTENT,
+        Ok(false) => StatusCode::NOT_FOUND,
+        Err(_) => StatusCode::BAD_REQUEST,
+    }
+}
+
+/// Приложение открывает эту страницу в своём WebView с кодом из ссылки и
+/// своим секретом — здесь сессия и ложится в cookie приложения.
+async fn google_app_finish(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    let (Some(code), Some(verifier)) = (q.get("code"), q.get("verifier")) else {
+        return google_page(None, "Вход не завершён, попробуйте ещё раз");
+    };
+    let conn = state.db.lock();
+    let Some(uid) = google::redeem_handoff(&conn, code, verifier) else {
+        return google_page(None, "Ссылка входа устарела, попробуйте войти заново");
+    };
+    match auth::create_session(&conn, uid) {
+        Ok(token) => google_page(Some(&token), ""),
+        Err(e) => google_page(None, &format!("Не удалось создать сессию: {e}")),
+    }
+}
+
+/// Страница во внешнем браузере после входа, начатого в приложении: уводит
+/// обратно в приложение. Ссылка intent:// с явным пакетом — чтобы код не
+/// достался другому приложению с той же схемой (хотя без секрета он ему и
+/// бесполезен). Кнопка — на случай, если браузер не даст перейти без касания.
+fn google_app_page(code: Option<&str>, error: &str) -> axum::response::Response {
+    let target = match code {
+        Some(c) => format!("intent://google?code={c}#Intent;scheme=ru.meshkeeper.app;package=ru.meshkeeper.app;end"),
+        None => "intent://google#Intent;scheme=ru.meshkeeper.app;package=ru.meshkeeper.app;end".to_string(),
+    };
+    let (title, text, auto) = if error.is_empty() {
+        ("Вход выполнен", "Возвращаемся в приложение…".to_string(), true)
+    } else {
+        ("Вход не удался", format!("Войти через Google не получилось: {}", html_escape(error)), false)
+    };
+    let body = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\">\
+         <title>{title}</title>\
+         <div style=\"font:16px system-ui;margin:3rem 1.5rem;max-width:34rem\">\
+         <p>{text}</p>\
+         <p><a href=\"{target}\" style=\"display:inline-block;padding:.75rem 1.25rem;border-radius:.5rem;\
+         background:#2563eb;color:#fff;text-decoration:none\">Вернуться в приложение</a></p></div>{script}",
+        script = if auto { format!("<script>location.replace('{target}')</script>") } else { String::new() },
+    );
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .header("cache-control", "no-store")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// Страница-переходник. При успехе ставит cookie и уводит в приложение,
@@ -793,6 +901,8 @@ async fn main() {
             get(sync_journal_get).post(sync_journal_post),
         )
         .route("/auth/google/callback", get(google_callback))
+        .route("/auth/google/app", axum::routing::post(google_app_mark))
+        .route("/auth/google/app-finish", get(google_app_finish))
         .route("/files/{name}", get(serve_attachment))
         .route("/api/trpc/{*procedures}", any(trpc))
         .merge(update::routes(frontend))

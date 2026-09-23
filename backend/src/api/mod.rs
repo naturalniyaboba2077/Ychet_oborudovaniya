@@ -1280,6 +1280,7 @@ mod tests {
             phone: Some(owner_phone),
             full_name: Some("Чужой".into()),
             link_user_id: None,
+            app_challenge: None,
         };
         let attempt = google_finish(&conn, &identity, &pending);
         assert!(
@@ -1321,6 +1322,7 @@ mod tests {
             phone: Some("+79995552222".into()),
             full_name: Some("Монтажник".into()),
             link_user_id: None,
+            app_challenge: None,
         };
         let uid = google_finish(&conn, &identity, &pending).expect("вход через Google");
 
@@ -1351,6 +1353,7 @@ mod tests {
                 phone: None,
                 full_name: None,
                 link_user_id: None,
+                app_challenge: None,
             },
         )
         .expect("повторный вход");
@@ -1379,6 +1382,7 @@ mod tests {
                 phone: None,
                 full_name: Some("Новый".into()),
                 link_user_id: None,
+                app_challenge: None,
             },
         );
         assert!(without_phone.is_err(), "без телефона заводить нельзя");
@@ -1391,6 +1395,7 @@ mod tests {
                 phone: Some("+79995553333".into()),
                 full_name: Some("Новый".into()),
                 link_user_id: None,
+                app_challenge: None,
             },
         )
         .expect("с телефоном аккаунт заводится");
